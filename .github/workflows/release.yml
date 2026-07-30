@@ -103,7 +103,7 @@ jobs:
           Compress-Archive -Path dist/* -DestinationPath "${{ matrix.target_name }}-${{ needs.validate-tag.outputs.tag }}.zip"
 
       - name: Upload release asset staging
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.target_name }}
           path: |
