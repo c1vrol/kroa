@@ -5,3 +5,9 @@
 **/*.pdb
 **/*.ll
 .DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.cargo-cache/

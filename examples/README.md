@@ -8,6 +8,8 @@
 | `struct_point.kroa` | Structs |
 | `arena_string.kroa` | Arenas and strings |
 | `borrow_mut.kroa` | Mutable references |
+| `array_slice.kroa` | Fixed arrays, indexing, and slices |
+| `enum_result.kroa` | Enums with data and exhaustive `match` |
 | `ffi_labs.kroa` | Scalar FFI |
 | `ffi_add.kroa` | Linking a C file |
 | `ffi_struct.kroa` | C-layout structs |

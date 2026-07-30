@@ -45,6 +45,22 @@ pub enum DiagnosticCode {
     E0303,
     /// Return type mismatch
     E0304,
+    /// Array/slice type or indexing error
+    E0305,
+    /// Invalid static index or slice range
+    E0306,
+    /// Partial move from array/slice element
+    E0307,
+    /// Array literal length or element type mismatch
+    E0308,
+    /// Unknown enum or variant
+    E0309,
+    /// Non-exhaustive match
+    E0310,
+    /// Unreachable / redundant match arm
+    E0311,
+    /// Enum constructor or pattern payload mismatch
+    E0312,
     /// Borrow conflict
     E0400,
     /// Assign while borrowed
@@ -74,6 +90,14 @@ impl DiagnosticCode {
             DiagnosticCode::E0302 => "E0302",
             DiagnosticCode::E0303 => "E0303",
             DiagnosticCode::E0304 => "E0304",
+            DiagnosticCode::E0305 => "E0305",
+            DiagnosticCode::E0306 => "E0306",
+            DiagnosticCode::E0307 => "E0307",
+            DiagnosticCode::E0308 => "E0308",
+            DiagnosticCode::E0309 => "E0309",
+            DiagnosticCode::E0310 => "E0310",
+            DiagnosticCode::E0311 => "E0311",
+            DiagnosticCode::E0312 => "E0312",
             DiagnosticCode::E0400 => "E0400",
             DiagnosticCode::E0401 => "E0401",
             DiagnosticCode::E0402 => "E0402",

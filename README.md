@@ -2,9 +2,10 @@
 
 Kroa is a compiled programming language with Python-like indentation and native performance through LLVM.
 
-**Current version:** Alpha-1.0.0 (`A-1.0.0`)  
-**Cargo version:** `1.0.0-alpha`  
-**Living project summary:** [`PROJECT_STATUS.md`](PROJECT_STATUS.md)
+**Current version:** Alpha-2.0.0 (`A-2.0.0`)  
+**Cargo version:** `2.0.0-alpha`  
+**Living project summary:** [`PROJECT_STATUS.md`](PROJECT_STATUS.md)  
+**Changelog:** [`CHANGELOG.md`](CHANGELOG.md)
 
 **Language, syntax, keywords, and error messages are English-only.**  
 Documentation is available in English and Spanish.
@@ -12,6 +13,8 @@ Documentation is available in English and Spanish.
 - [English docs](docs/en/getting-started.md)
 - [Documentación en español](docs/es/getting-started.md)
 - [AI agent specification](docs/en/agent-spec.md) ([español](docs/es/agent-spec.md)) · [`AGENTS.md`](AGENTS.md)
+- [NLL-lite borrow checker internals](docs/en/borrow-checker.md) ([explicación técnica en español](docs/es/borrow-checker.md))
+- [Versioning and release process](docs/en/versioning.md) ([español](docs/es/versioning.md))
 
 ## What Kroa is
 
@@ -21,7 +24,7 @@ Kroa aims to feel easy to read, while compiling ahead-of-time to a native execut
 |------|-------------------------|
 | Easy to read | Indentation-based syntax, clear keywords |
 | Fast | Compiles to LLVM IR, then to native code |
-| Safer memory | Arenas and borrow checking (phased) |
+| Safer memory | Arenas and NLL-lite borrow checking |
 | Works with C | `extern "C"` foreign function interface |
 
 ## Requirements
@@ -88,16 +91,24 @@ Kroa is designed so agents can auto-fix code in a loop:
 
 See [`docs/en/agent-spec.md`](docs/en/agent-spec.md) for the full static agent context.
 
+## Development vs production
+
+| Environment | Branch | Purpose |
+|-------------|--------|---------|
+| Development | `develop` | Integration, CI checks, temporary artifacts |
+| Production | `main` + tags `A-*` | Verified releases only |
+
+See [`docs/en/versioning.md`](docs/en/versioning.md) for the full branching and release model.
+
 ## Project status
 
-Kroa is an MVP under active development. The four technical phases are:
+Kroa is an Alpha-stage language under active development. Alpha-2.0.0 adds:
 
-1. Structural AOT pipeline (lexer, parser, types, native codegen)
-2. Kroa IR, structs, moves, lexical arenas
-3. Borrow checking for `&T` / `&mut T`
-4. Advanced C FFI and strings
+1. Fixed arrays and safe slicing
+2. Enums with `match` / `case`
+3. NLL-lite borrow checking
 
-See the language guide for what works today and how to use it.
+See the language guide and project status for what works today.
 
 ## License
 

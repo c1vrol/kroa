@@ -1,7 +1,7 @@
 //! Kroa IR: a simple typed SSA-like instruction stream with basic blocks.
 
 use crate::span::Span;
-use crate::typecheck::{FnInfo, StructInfo, Type};
+use crate::typecheck::{EnumInfo, FnInfo, StructInfo, Type};
 use std::collections::HashMap;
 use std::fmt::Write as _;
 
@@ -14,6 +14,7 @@ pub struct BlockId(pub u32);
 #[derive(Debug, Clone)]
 pub struct Module {
     pub structs: HashMap<String, StructInfo>,
+    pub enums: HashMap<String, EnumInfo>,
     pub functions: Vec<Function>,
     pub externs: Vec<ExternFn>,
 }
@@ -51,6 +52,11 @@ pub enum Terminator {
         cond: ValueId,
         then_block: BlockId,
         else_block: BlockId,
+    },
+    Switch {
+        discr: ValueId,
+        cases: Vec<(u32, BlockId)>,
+        default: BlockId,
     },
     Unreachable,
 }
@@ -117,6 +123,8 @@ pub enum InstKind {
     Ref {
         mutable: bool,
         place: ValueId,
+        /// When borrowing a projected place (index/slice), the root alloca for aliasing.
+        alias_root: Option<ValueId>,
     },
     Deref {
         ptr: ValueId,
@@ -129,6 +137,49 @@ pub enum InstKind {
     },
     ToCString {
         value: ValueId,
+    },
+    /// Aggregate array value from element SSA values.
+    ArrayAgg {
+        elems: Vec<ValueId>,
+    },
+    /// Length of an array value, array pointer, or slice `{ptr,len}`.
+    Len {
+        value: ValueId,
+    },
+    /// Abort if `index < 0` or `index >= len`.
+    BoundsCheck {
+        index: ValueId,
+        len: ValueId,
+    },
+    /// Abort unless `0 <= start <= end <= len`.
+    SliceBoundsCheck {
+        start: ValueId,
+        end: ValueId,
+        len: ValueId,
+    },
+    /// Pointer to element `base[index]`. `base` is an array alloca or a slice value.
+    ElemPtr {
+        base: ValueId,
+        index: ValueId,
+    },
+    /// Build a slice `{ptr,len}` from an array alloca or existing slice.
+    SliceFrom {
+        base: ValueId,
+        start: ValueId,
+        end: ValueId,
+    },
+    EnumConstruct {
+        enum_name: String,
+        variant_index: usize,
+        fields: Vec<ValueId>,
+    },
+    EnumTag {
+        value: ValueId,
+    },
+    EnumField {
+        value: ValueId,
+        variant_index: usize,
+        field_index: usize,
     },
 }
 
@@ -224,11 +275,18 @@ fn format_inst(inst: &Inst) -> String {
         }
         InstKind::Cast { value, to } => format!("cast %{} to {}", value.0, to.display()),
         InstKind::Move { value } => format!("move %{}", value.0),
-        InstKind::Ref { mutable, place } => {
+        InstKind::Ref {
+            mutable,
+            place,
+            alias_root,
+        } => {
+            let root = alias_root
+                .map(|r| format!(" root %{}", r.0))
+                .unwrap_or_default();
             if *mutable {
-                format!("ref.mut %{}", place.0)
+                format!("ref.mut %{}{root}", place.0)
             } else {
-                format!("ref %{}", place.0)
+                format!("ref %{}{root}", place.0)
             }
         }
         InstKind::Deref { ptr } => format!("deref %{}", ptr.0),
@@ -236,6 +294,37 @@ fn format_inst(inst: &Inst) -> String {
         InstKind::ArenaExit => "arena.exit".into(),
         InstKind::ArenaAlloc { nbytes } => format!("arena.alloc %{}", nbytes.0),
         InstKind::ToCString { value } => format!("to_c_string %{}", value.0),
+        InstKind::ArrayAgg { elems } => {
+            let a: Vec<_> = elems.iter().map(|v| format!("%{}", v.0)).collect();
+            format!("array {{ {} }}", a.join(", "))
+        }
+        InstKind::Len { value } => format!("len %{}", value.0),
+        InstKind::BoundsCheck { index, len } => {
+            format!("bounds_check %{} < %{}", index.0, len.0)
+        }
+        InstKind::SliceBoundsCheck { start, end, len } => {
+            format!("slice_bounds_check %{}..%{} of %{}", start.0, end.0, len.0)
+        }
+        InstKind::ElemPtr { base, index } => {
+            format!("elemptr %{}[%{}]", base.0, index.0)
+        }
+        InstKind::SliceFrom { base, start, end } => {
+            format!("slice %{}[%{}..%{}]", base.0, start.0, end.0)
+        }
+        InstKind::EnumConstruct {
+            enum_name,
+            variant_index,
+            fields,
+        } => {
+            let a: Vec<_> = fields.iter().map(|v| format!("%{}", v.0)).collect();
+            format!("enum {enum_name}[{variant_index}] {{ {} }}", a.join(", "))
+        }
+        InstKind::EnumTag { value } => format!("enum.tag %{}", value.0),
+        InstKind::EnumField {
+            value,
+            variant_index,
+            field_index,
+        } => format!("enum.field %{}[{variant_index}].{field_index}", value.0),
     };
     format!("{dest}{body}")
 }
@@ -253,6 +342,22 @@ fn format_term(term: &Terminator) -> String {
             "branch %{} block_{} block_{}",
             cond.0, then_block.0, else_block.0
         ),
+        Terminator::Switch {
+            discr,
+            cases,
+            default,
+        } => {
+            let cs: Vec<_> = cases
+                .iter()
+                .map(|(t, b)| format!("{t} -> block_{}", b.0))
+                .collect();
+            format!(
+                "switch %{} [{}] else block_{}",
+                discr.0,
+                cs.join(", "),
+                default.0
+            )
+        }
         Terminator::Unreachable => "unreachable".into(),
     }
 }

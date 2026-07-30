@@ -46,3 +46,44 @@ fn rejects_interior_nul_at_runtime_boundary_ir() {
     .unwrap();
     assert!(r.llvm_ir.contains("kroa_str_to_cstr"), "{}", r.llvm_ir);
 }
+
+#[test]
+fn rejects_arrays_in_extern_signatures() {
+    let options = CompileOptions {
+        emit_ir: true,
+        ..Default::default()
+    };
+    match compile_source(
+        "ffi_arr.kroa",
+        "extern \"C\" fn takes_arr(xs: [i64; 2]) -> i64\n\nfn main() -> i64:\n    return 0\n",
+        &options,
+    ) {
+        Ok(_) => panic!("expected FFI array rejection"),
+        Err(d) => {
+            let msg: String = d.iter().map(|x| x.to_string()).collect();
+            assert!(
+                msg.contains("arrays and slices") || msg.contains("E0500"),
+                "{msg}"
+            );
+        }
+    }
+}
+
+#[test]
+fn rejects_enums_in_extern_signatures() {
+    let options = CompileOptions {
+        emit_ir: true,
+        ..Default::default()
+    };
+    match compile_source(
+        "ffi_enum.kroa",
+        "enum E:\n    A\n\nextern \"C\" fn takes_e(x: E) -> i64\n\nfn main() -> i64:\n    return 0\n",
+        &options,
+    ) {
+        Ok(_) => panic!("expected FFI enum rejection"),
+        Err(d) => {
+            let msg: String = d.iter().map(|x| x.to_string()).collect();
+            assert!(msg.contains("enum") || msg.contains("E0500"), "{msg}");
+        }
+    }
+}

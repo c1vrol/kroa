@@ -42,3 +42,45 @@ fn main() -> i64:
     assert!(kir.contains("arena.enter"), "{kir}");
     assert!(kir.contains("arena.exit"), "{kir}");
 }
+
+#[test]
+fn lowers_array_index_and_slice() {
+    let kir = compile_kir(
+        r#"
+fn main() -> i64:
+    let mut a: [i64; 3] = [1, 2, 3]
+    let x = a[1]
+    let s = &a[0..2]
+    print_i64(x)
+    print_i64(len(s))
+    return 0
+"#,
+    );
+    assert!(kir.contains("array {"), "{kir}");
+    assert!(kir.contains("bounds_check"), "{kir}");
+    assert!(kir.contains("elemptr"), "{kir}");
+    assert!(kir.contains("slice"), "{kir}");
+}
+
+#[test]
+fn lowers_enum_match_switch() {
+    let kir = compile_kir(
+        r#"
+enum Result:
+    Ok(value: i64)
+    Err(code: i64)
+
+fn main() -> i64:
+    let r = Result::Ok(3)
+    match r:
+        case Result::Ok(v):
+            print_i64(v)
+        case Result::Err(c):
+            print_i64(c)
+    return 0
+"#,
+    );
+    assert!(kir.contains("enum Result"), "{kir}");
+    assert!(kir.contains("enum.tag"), "{kir}");
+    assert!(kir.contains("switch"), "{kir}");
+}

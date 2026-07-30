@@ -114,3 +114,26 @@ char *kroa_str_to_cstr(const char *ptr, int64_t len) {
     out[len] = '\0';
     return out;
 }
+
+/* ---- safe indexing / slicing ---- */
+
+void kroa_bounds_panic(int64_t index, int64_t len) {
+    fprintf(
+        stderr,
+        "kroa: index out of bounds: index=%lld, len=%lld\n",
+        (long long)index,
+        (long long)len
+    );
+    abort();
+}
+
+void kroa_slice_bounds_panic(int64_t start, int64_t end, int64_t len) {
+    fprintf(
+        stderr,
+        "kroa: slice out of bounds: start=%lld, end=%lld, len=%lld\n",
+        (long long)start,
+        (long long)end,
+        (long long)len
+    );
+    abort();
+}

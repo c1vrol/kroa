@@ -62,3 +62,38 @@ fn main() -> i64:
     );
     assert!(diags.iter().any(|d| d.help.is_some()));
 }
+
+#[test]
+fn array_static_oob_has_stable_code() {
+    let diags = err(r#"
+fn main() -> i64:
+    let a: [i64; 1] = [7]
+    return a[1]
+"#);
+    assert!(
+        diags.iter().any(|d| d.code.as_str() == "E0306"),
+        "{:?}",
+        diags.iter().map(|d| d.code.as_str()).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn non_exhaustive_match_has_stable_code() {
+    let diags = err(r#"
+enum Opt:
+    Some(value: i64)
+    None
+
+fn main() -> i64:
+    let x = Opt::None
+    match x:
+        case Opt::Some(v):
+            print_i64(v)
+    return 0
+"#);
+    assert!(
+        diags.iter().any(|d| d.code.as_str() == "E0310"),
+        "{:?}",
+        diags.iter().map(|d| d.code.as_str()).collect::<Vec<_>>()
+    );
+}

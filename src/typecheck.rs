@@ -28,15 +28,22 @@ pub enum Type {
     CString,
     Named(String),
     Struct(String),
+    Enum(String),
     Ref { mutable: bool, inner: Box<Type> },
+    Array { element: Box<Type>, len: usize },
+    Slice(Box<Type>),
 }
 
 impl Type {
     pub fn is_copy(&self) -> bool {
-        matches!(
-            self,
-            Type::I64 | Type::F64 | Type::Bool | Type::Unit | Type::CChar | Type::Ref { .. }
-        )
+        match self {
+            Type::I64 | Type::F64 | Type::Bool | Type::Unit | Type::CChar => true,
+            // Shared references may be copied. Mutable references are exclusive.
+            Type::Ref { mutable, .. } => !*mutable,
+            Type::Array { element, .. } => element.is_copy(),
+            Type::Slice(_) => false,
+            Type::Str | Type::CString | Type::Named(_) | Type::Struct(_) | Type::Enum(_) => false,
+        }
     }
 
     pub fn is_scalar_ffi(&self) -> bool {
@@ -55,7 +62,7 @@ impl Type {
             Type::Str => "str".into(),
             Type::CChar => "c_char".into(),
             Type::CString => "c_string".into(),
-            Type::Named(n) | Type::Struct(n) => n.clone(),
+            Type::Named(n) | Type::Struct(n) | Type::Enum(n) => n.clone(),
             Type::Ref { mutable, inner } => {
                 if *mutable {
                     format!("&mut {}", inner.display())
@@ -63,6 +70,24 @@ impl Type {
                     format!("&{}", inner.display())
                 }
             }
+            Type::Array { element, len } => format!("[{}; {len}]", element.display()),
+            Type::Slice(element) => format!("[{}]", element.display()),
+        }
+    }
+
+    pub fn element_type(&self) -> Option<&Type> {
+        match self {
+            Type::Array { element, .. } | Type::Slice(element) => Some(element),
+            Type::Ref { inner, .. } => inner.element_type(),
+            _ => None,
+        }
+    }
+
+    pub fn array_len(&self) -> Option<usize> {
+        match self {
+            Type::Array { len, .. } => Some(*len),
+            Type::Ref { inner, .. } => inner.array_len(),
+            _ => None,
         }
     }
 }
@@ -72,6 +97,21 @@ pub struct StructInfo {
     pub name: String,
     pub fields: Vec<(String, Type)>,
     pub is_c_repr: bool,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct EnumInfo {
+    pub name: String,
+    pub variants: Vec<VariantInfo>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct VariantInfo {
+    pub name: String,
+    pub tag: u32,
+    pub fields: Vec<(String, Type)>,
     pub span: Span,
 }
 
@@ -88,18 +128,23 @@ pub struct FnInfo {
 #[derive(Debug, Clone)]
 pub struct TypedProgram {
     pub structs: HashMap<String, StructInfo>,
+    pub enums: HashMap<String, EnumInfo>,
     pub functions: HashMap<String, FnInfo>,
     pub order: Vec<String>,
     pub has_structs: bool,
+    pub has_enums: bool,
     pub has_arenas: bool,
     pub has_refs: bool,
     pub has_strings: bool,
     pub has_advanced_ffi: bool,
+    pub has_arrays: bool,
 }
 
 impl TypedProgram {
     pub fn needs_borrow_check(&self) -> bool {
-        self.has_refs
+        // Arena-backed pointer-like values (for example `c_string`) also need
+        // escape analysis even when the source program contains no `&T`.
+        self.has_refs || self.has_arenas
     }
 }
 
@@ -111,23 +156,36 @@ pub fn typecheck(
     let mut checker = Typechecker {
         diagnostics,
         structs: HashMap::new(),
+        enums: HashMap::new(),
         functions: HashMap::new(),
         order: Vec::new(),
         has_structs: false,
+        has_enums: false,
         has_arenas: false,
         has_refs: false,
         has_strings: false,
         has_advanced_ffi: false,
+        has_arrays: false,
         scopes: Vec::new(),
         current_return: Type::Unit,
         in_unsafe: false,
+        arena_depth: 0,
         expr_types: HashMap::new(),
     };
 
-    // Collect structs first.
+    // Register type names first (structs + enums) so fields can refer to later types.
     for item in &program.items {
-        if let Item::Struct(def) = item {
-            checker.define_struct(def);
+        match item {
+            Item::Struct(def) => checker.register_struct_name(def),
+            Item::Enum(def) => checker.register_enum_name(def),
+            _ => {}
+        }
+    }
+    for item in &program.items {
+        match item {
+            Item::Struct(def) => checker.define_struct_fields(def),
+            Item::Enum(def) => checker.define_enum_variants(def),
+            _ => {}
         }
     }
 
@@ -136,7 +194,7 @@ pub fn typecheck(
         match item {
             Item::Function(f) => checker.define_function(f),
             Item::Extern(e) => checker.define_extern(e),
-            Item::Struct(_) => {}
+            Item::Struct(_) | Item::Enum(_) => {}
         }
     }
 
@@ -158,16 +216,18 @@ pub fn typecheck(
         return None;
     }
 
-    // Rebuild function map with checked bodies (bodies already in FnInfo from define).
     Some(TypedProgram {
         structs: checker.structs,
+        enums: checker.enums,
         functions: checker.functions,
         order: checker.order,
         has_structs: checker.has_structs,
+        has_enums: checker.has_enums,
         has_arenas: checker.has_arenas,
         has_refs: checker.has_refs,
         has_strings: checker.has_strings,
         has_advanced_ffi: checker.has_advanced_ffi,
+        has_arrays: checker.has_arrays,
     })
 }
 
@@ -180,48 +240,140 @@ struct Local {
 struct Typechecker<'a> {
     diagnostics: &'a mut Diagnostics,
     structs: HashMap<String, StructInfo>,
+    enums: HashMap<String, EnumInfo>,
     functions: HashMap<String, FnInfo>,
     order: Vec<String>,
     has_structs: bool,
+    has_enums: bool,
     has_arenas: bool,
     has_refs: bool,
     has_strings: bool,
     has_advanced_ffi: bool,
+    has_arrays: bool,
     scopes: Vec<HashMap<String, Local>>,
     current_return: Type,
     in_unsafe: bool,
+    arena_depth: u32,
     #[allow(dead_code)]
     expr_types: HashMap<usize, Type>,
 }
 
 impl<'a> Typechecker<'a> {
-    fn define_struct(&mut self, def: &StructDef) {
-        if self.structs.contains_key(&def.name) {
-            self.diagnostics.error_at(
-                def.span,
-                format!("struct `{}` is already defined", def.name),
-            );
+    fn type_name_taken(&self, name: &str) -> bool {
+        self.structs.contains_key(name) || self.enums.contains_key(name)
+    }
+
+    fn register_struct_name(&mut self, def: &StructDef) {
+        if self.type_name_taken(&def.name) {
+            self.diagnostics
+                .error_at(def.span, format!("type `{}` is already defined", def.name));
             return;
         }
         self.has_structs = true;
         if def.is_c_repr {
             self.has_advanced_ffi = true;
         }
-        let mut fields = Vec::new();
-        for field in &def.fields {
-            if let Some(ty) = self.resolve_type(&field.ty) {
-                fields.push((field.name.clone(), ty));
-            }
-        }
         self.structs.insert(
             def.name.clone(),
             StructInfo {
                 name: def.name.clone(),
-                fields,
+                fields: Vec::new(),
                 is_c_repr: def.is_c_repr,
                 span: def.span,
             },
         );
+    }
+
+    fn define_struct_fields(&mut self, def: &StructDef) {
+        let Some(info) = self.structs.get(&def.name).cloned() else {
+            return;
+        };
+        let mut fields = Vec::new();
+        for field in &def.fields {
+            if let Some(ty) = self.resolve_type(&field.ty) {
+                fields.push((field.name.clone(), ty))
+            }
+        }
+        self.structs
+            .insert(def.name.clone(), StructInfo { fields, ..info });
+    }
+
+    fn register_enum_name(&mut self, def: &EnumDef) {
+        if self.type_name_taken(&def.name) {
+            self.diagnostics
+                .error_at(def.span, format!("type `{}` is already defined", def.name));
+            return;
+        }
+        self.has_enums = true;
+        self.enums.insert(
+            def.name.clone(),
+            EnumInfo {
+                name: def.name.clone(),
+                variants: Vec::new(),
+                span: def.span,
+            },
+        );
+    }
+
+    fn define_enum_variants(&mut self, def: &EnumDef) {
+        let Some(info) = self.enums.get(&def.name).cloned() else {
+            return;
+        };
+        let mut variants = Vec::new();
+        let mut seen = HashMap::new();
+        for (tag, variant) in def.variants.iter().enumerate() {
+            if seen.insert(variant.name.clone(), ()).is_some() {
+                self.diagnostics.push(
+                    Diagnostic::error_at_code(
+                        variant.span,
+                        DiagnosticCode::E0309,
+                        format!(
+                            "duplicate variant `{}` in enum `{}`",
+                            variant.name, def.name
+                        ),
+                    )
+                    .help("variant names must be unique within an enum"),
+                );
+            }
+            let mut fields = Vec::new();
+            let mut field_names = HashMap::new();
+            for field in &variant.fields {
+                if field_names.insert(field.name.clone(), ()).is_some() {
+                    self.diagnostics.error_at(
+                        field.span,
+                        format!(
+                            "duplicate field `{}` in variant `{}::{}`",
+                            field.name, def.name, variant.name
+                        ),
+                    );
+                }
+                if let Some(ty) = self.resolve_type(&field.ty) {
+                    // Reject direct recursive enum-by-value cycles for this MVP.
+                    if matches!(&ty, Type::Enum(n) if n == &def.name) {
+                        self.diagnostics.push(
+                            Diagnostic::error_at_code(
+                                field.span,
+                                DiagnosticCode::E0312,
+                                format!(
+                                    "recursive enum `{0}` by value is not supported; payloads cannot contain `{0}` directly",
+                                    def.name
+                                ),
+                            )
+                            .help("use a non-recursive payload type in this release"),
+                        );
+                    }
+                    fields.push((field.name.clone(), ty));
+                }
+            }
+            variants.push(VariantInfo {
+                name: variant.name.clone(),
+                tag: tag as u32,
+                fields,
+                span: variant.span,
+            });
+        }
+        self.enums
+            .insert(def.name.clone(), EnumInfo { variants, ..info });
     }
 
     fn define_function(&mut self, f: &Function) {
@@ -301,6 +453,30 @@ impl<'a> Typechecker<'a> {
                     "raw references are not allowed directly in extern signatures; use C types",
                 );
             }
+            Type::Array { .. } | Type::Slice(_) => {
+                self.diagnostics.push(
+                    Diagnostic::error_at_code(
+                        span,
+                        DiagnosticCode::E0500,
+                        "arrays and slices are not allowed in `extern \"C\"` signatures yet",
+                    )
+                    .help(
+                        "pass scalars or C-layout structs across FFI until an array ABI is defined",
+                    ),
+                );
+            }
+            Type::Enum(name) => {
+                self.diagnostics.push(
+                    Diagnostic::error_at_code(
+                        span,
+                        DiagnosticCode::E0500,
+                        format!("enum `{name}` is not allowed in `extern \"C\"` signatures yet"),
+                    )
+                    .help(
+                        "pass scalars or C-layout structs across FFI until an enum ABI is defined",
+                    ),
+                );
+            }
             Type::Named(name) => {
                 self.diagnostics
                     .error_at(span, format!("unknown FFI type `{name}`"));
@@ -319,6 +495,10 @@ impl<'a> Typechecker<'a> {
     }
 
     fn resolve_type(&mut self, ty: &TypeExpr) -> Option<Type> {
+        self.resolve_type_inner(ty, false)
+    }
+
+    fn resolve_type_inner(&mut self, ty: &TypeExpr, allow_slice: bool) -> Option<Type> {
         match &ty.kind {
             TypeExprKind::Unit => Some(Type::Unit),
             TypeExprKind::Named(name) => match name.as_str() {
@@ -343,6 +523,9 @@ impl<'a> Typechecker<'a> {
                     if self.structs.contains_key(other) {
                         self.has_structs = true;
                         Some(Type::Struct(other.to_string()))
+                    } else if self.enums.contains_key(other) {
+                        self.has_enums = true;
+                        Some(Type::Enum(other.to_string()))
                     } else {
                         self.diagnostics
                             .error_at(ty.span, format!("unknown type `{other}`"));
@@ -352,11 +535,48 @@ impl<'a> Typechecker<'a> {
             },
             TypeExprKind::Ref { mutable, inner } => {
                 self.has_refs = true;
-                let inner = self.resolve_type(inner)?;
+                let allow_inner_slice = matches!(inner.kind, TypeExprKind::Slice { .. });
+                let inner = self.resolve_type_inner(inner, allow_inner_slice)?;
+                if matches!(inner, Type::Slice(_)) {
+                    self.has_arrays = true;
+                }
                 Some(Type::Ref {
                     mutable: *mutable,
                     inner: Box::new(inner),
                 })
+            }
+            TypeExprKind::Array { elem, len } => {
+                self.has_arrays = true;
+                let element = self.resolve_type_inner(elem, false)?;
+                if matches!(element, Type::Slice(_)) {
+                    self.diagnostics.push(
+                        Diagnostic::error_at_code(
+                            ty.span,
+                            DiagnosticCode::E0305,
+                            "array elements cannot be unsized slices; use a fixed array or a reference",
+                        )
+                        .help("write `[T; N]` for a fixed array, or store `&[T]` / `&mut [T]`"),
+                    );
+                }
+                Some(Type::Array {
+                    element: Box::new(element),
+                    len: *len as usize,
+                })
+            }
+            TypeExprKind::Slice { elem } => {
+                self.has_arrays = true;
+                let element = self.resolve_type_inner(elem, false)?;
+                if !allow_slice {
+                    self.diagnostics.push(
+                        Diagnostic::error_at_code(
+                            ty.span,
+                            DiagnosticCode::E0305,
+                            "unsized slice type `[T]` must appear behind `&` or `&mut`",
+                        )
+                        .help("write `&[T]` or `&mut [T]` for a slice reference"),
+                    );
+                }
+                Some(Type::Slice(Box::new(element)))
             }
         }
     }
@@ -391,25 +611,39 @@ impl<'a> Typechecker<'a> {
                 value,
                 span,
             } => {
-                let value_ty = self.check_expr(value);
                 let final_ty = if let Some(ann) = ty {
-                    let ann_ty = self.resolve_type(ann).unwrap_or(value_ty.clone());
+                    let ann_ty = self.resolve_type(ann).unwrap_or(Type::Unit);
+                    let value_ty = self.check_expr_expected(value, Some(&ann_ty));
                     if ann_ty != value_ty && !self.can_coerce(&value_ty, &ann_ty) {
-                        self.diagnostics.error_at(
-                            *span,
-                            format!(
-                                "type mismatch: expected `{}`, found `{}`",
-                                ann_ty.display(),
-                                value_ty.display()
-                            ),
+                        self.diagnostics.push(
+                            Diagnostic::error_at_code(
+                                *span,
+                                DiagnosticCode::E0301,
+                                format!(
+                                    "type mismatch: expected `{}`, found `{}`",
+                                    ann_ty.display(),
+                                    value_ty.display()
+                                ),
+                            )
+                            .help("change the assigned expression type, or cast with `as` when converting numbers"),
                         );
                     }
                     ann_ty
                 } else {
-                    value_ty
+                    self.check_expr(value)
                 };
                 // Move non-copy values out of the RHS name if applicable.
                 self.maybe_move_expr(value);
+                if matches!(final_ty, Type::Slice(_)) {
+                    self.diagnostics.push(
+                        Diagnostic::error_at_code(
+                            *span,
+                            DiagnosticCode::E0305,
+                            "cannot store an unsized slice by value; use `&[T]` or `&mut [T]`",
+                        )
+                        .help("write `let s = &array[start..end]` to borrow a slice"),
+                    );
+                }
                 self.declare(name, final_ty, *mutable, *span);
             }
             Stmt::Assign {
@@ -472,15 +706,22 @@ impl<'a> Typechecker<'a> {
                         }
                     }
                     ExprKind::Field { .. } | ExprKind::Deref { .. } | ExprKind::Index { .. } => {
+                        if let ExprKind::Index { base, .. } = &target.kind {
+                            self.check_index_assignable(base, *span);
+                        }
                         let target_ty = self.check_expr(target);
                         if target_ty != value_ty {
-                            self.diagnostics.error_at(
-                                *span,
-                                format!(
-                                    "type mismatch: expected `{}`, found `{}`",
-                                    target_ty.display(),
-                                    value_ty.display()
-                                ),
+                            self.diagnostics.push(
+                                Diagnostic::error_at_code(
+                                    *span,
+                                    DiagnosticCode::E0301,
+                                    format!(
+                                        "type mismatch: expected `{}`, found `{}`",
+                                        target_ty.display(),
+                                        value_ty.display()
+                                    ),
+                                )
+                                .help("change the assigned expression type, or cast with `as` when converting numbers"),
                             );
                         }
                     }
@@ -549,7 +790,9 @@ impl<'a> Typechecker<'a> {
             }
             Stmt::Arena { body, .. } => {
                 self.has_arenas = true;
+                self.arena_depth = self.arena_depth.saturating_add(1);
                 self.check_block(body);
+                self.arena_depth = self.arena_depth.saturating_sub(1);
             }
             Stmt::Unsafe { body, .. } => {
                 let prev = self.in_unsafe;
@@ -557,14 +800,282 @@ impl<'a> Typechecker<'a> {
                 self.check_block(body);
                 self.in_unsafe = prev;
             }
+            Stmt::Match {
+                scrutinee,
+                arms,
+                span,
+            } => {
+                self.check_match(scrutinee, arms, *span);
+            }
         }
+    }
+
+    fn check_match(&mut self, scrutinee: &Expr, arms: &[MatchArm], span: Span) {
+        let scrut_ty = self.check_expr(scrutinee);
+        self.maybe_move_expr(scrutinee);
+
+        let mut covered_variants: Vec<String> = Vec::new();
+        let mut covered_bools = (false, false);
+        let mut saw_wildcard = false;
+        let mut saw_binding = false;
+
+        for (i, arm) in arms.iter().enumerate() {
+            if saw_wildcard || saw_binding {
+                self.diagnostics.push(
+                    Diagnostic::error_at_code(
+                        arm.span,
+                        DiagnosticCode::E0311,
+                        "unreachable match arm",
+                    )
+                    .note("a previous `_` or binding pattern already covers every remaining value")
+                    .help("remove this arm or place it before the catch-all"),
+                );
+            }
+
+            let bindings = self.check_pattern(&arm.pattern, &scrut_ty);
+            match &arm.pattern.kind {
+                PatternKind::Wildcard => saw_wildcard = true,
+                PatternKind::Binding(_) => saw_binding = true,
+                PatternKind::Bool(v) => {
+                    if *v {
+                        if covered_bools.0 {
+                            self.diagnostics.push(
+                                Diagnostic::error_at_code(
+                                    arm.pattern.span,
+                                    DiagnosticCode::E0311,
+                                    "unreachable pattern: `true` already covered",
+                                )
+                                .help("remove the duplicate arm"),
+                            );
+                        }
+                        covered_bools.0 = true;
+                    } else {
+                        if covered_bools.1 {
+                            self.diagnostics.push(
+                                Diagnostic::error_at_code(
+                                    arm.pattern.span,
+                                    DiagnosticCode::E0311,
+                                    "unreachable pattern: `false` already covered",
+                                )
+                                .help("remove the duplicate arm"),
+                            );
+                        }
+                        covered_bools.1 = true;
+                    }
+                }
+                PatternKind::Variant {
+                    enum_name, variant, ..
+                } => {
+                    let key = format!("{enum_name}::{variant}");
+                    if covered_variants.iter().any(|v| v == &key) {
+                        self.diagnostics.push(
+                            Diagnostic::error_at_code(
+                                arm.pattern.span,
+                                DiagnosticCode::E0311,
+                                format!("unreachable pattern: `{key}` already covered"),
+                            )
+                            .help("remove the duplicate arm"),
+                        );
+                    } else {
+                        covered_variants.push(key);
+                    }
+                }
+            }
+
+            self.push_scope();
+            for (name, ty, bspan) in bindings {
+                self.declare(&name, ty, false, bspan);
+            }
+            self.check_block(&arm.body);
+            self.pop_scope();
+            let _ = i;
+        }
+
+        // Exhaustiveness
+        match &scrut_ty {
+            Type::Enum(ename) => {
+                if saw_wildcard || saw_binding {
+                    return;
+                }
+                if let Some(info) = self.enums.get(ename) {
+                    let missing: Vec<_> = info
+                        .variants
+                        .iter()
+                        .filter(|v| {
+                            let key = format!("{ename}::{}", v.name);
+                            !covered_variants.iter().any(|c| c == &key)
+                        })
+                        .map(|v| format!("{ename}::{}", v.name))
+                        .collect();
+                    if !missing.is_empty() {
+                        self.diagnostics.push(
+                            Diagnostic::error_at_code(
+                                span,
+                                DiagnosticCode::E0310,
+                                format!("non-exhaustive match on `{ename}`"),
+                            )
+                            .note(format!("missing pattern(s): {}", missing.join(", ")))
+                            .help("add the missing cases or a final `case _:`"),
+                        );
+                    }
+                }
+            }
+            Type::Bool => {
+                if saw_wildcard || saw_binding {
+                    return;
+                }
+                let mut missing = Vec::new();
+                if !covered_bools.0 {
+                    missing.push("`true`");
+                }
+                if !covered_bools.1 {
+                    missing.push("`false`");
+                }
+                if !missing.is_empty() {
+                    self.diagnostics.push(
+                        Diagnostic::error_at_code(
+                            span,
+                            DiagnosticCode::E0310,
+                            "non-exhaustive match on `bool`",
+                        )
+                        .note(format!("missing pattern(s): {}", missing.join(", ")))
+                        .help("cover both `true` and `false`, or add `case _:`"),
+                    );
+                }
+            }
+            _ => {
+                if !(saw_wildcard || saw_binding) {
+                    self.diagnostics.push(
+                        Diagnostic::error_at_code(
+                            span,
+                            DiagnosticCode::E0310,
+                            format!("non-exhaustive match on `{}`", scrut_ty.display()),
+                        )
+                        .note("only enums and `bool` support structured patterns in this release")
+                        .help("add a catch-all `case _:` or `case name:`"),
+                    );
+                }
+            }
+        }
+    }
+
+    fn check_pattern(&mut self, pattern: &Pattern, expected: &Type) -> Vec<(String, Type, Span)> {
+        let mut bindings = Vec::new();
+        match &pattern.kind {
+            PatternKind::Wildcard => {}
+            PatternKind::Binding(name) => {
+                bindings.push((name.clone(), expected.clone(), pattern.span));
+            }
+            PatternKind::Bool(_) => {
+                if *expected != Type::Bool {
+                    self.diagnostics.push(
+                        Diagnostic::error_at_code(
+                            pattern.span,
+                            DiagnosticCode::E0312,
+                            format!(
+                                "pattern type mismatch: expected `{}`, found `bool` pattern",
+                                expected.display()
+                            ),
+                        )
+                        .help("use a pattern that matches the scrutinee type"),
+                    );
+                }
+            }
+            PatternKind::Variant {
+                enum_name,
+                variant,
+                fields,
+            } => {
+                let Some(info) = self.enums.get(enum_name).cloned() else {
+                    self.diagnostics.push(
+                        Diagnostic::error_at_code(
+                            pattern.span,
+                            DiagnosticCode::E0309,
+                            format!("unknown enum `{enum_name}`"),
+                        )
+                        .help("declare the enum before matching on it"),
+                    );
+                    return bindings;
+                };
+                if let Type::Enum(ename) = expected {
+                    if ename != enum_name {
+                        self.diagnostics.push(
+                            Diagnostic::error_at_code(
+                                pattern.span,
+                                DiagnosticCode::E0312,
+                                format!(
+                                    "pattern type mismatch: expected `{ename}`, found `{enum_name}::{variant}`"
+                                ),
+                            )
+                            .help("match variants of the scrutinee enum only"),
+                        );
+                    }
+                } else {
+                    self.diagnostics.push(
+                        Diagnostic::error_at_code(
+                            pattern.span,
+                            DiagnosticCode::E0312,
+                            format!("cannot match enum pattern on `{}`", expected.display()),
+                        )
+                        .help("the scrutinee must be an enum value"),
+                    );
+                }
+                let Some(vinfo) = info.variants.iter().find(|v| v.name == *variant).cloned() else {
+                    self.diagnostics.push(
+                        Diagnostic::error_at_code(
+                            pattern.span,
+                            DiagnosticCode::E0309,
+                            format!("enum `{enum_name}` has no variant `{variant}`"),
+                        )
+                        .help("check the variant name spelling"),
+                    );
+                    return bindings;
+                };
+                if fields.len() != vinfo.fields.len() {
+                    self.diagnostics.push(
+                        Diagnostic::error_at_code(
+                            pattern.span,
+                            DiagnosticCode::E0312,
+                            format!(
+                                "variant `{enum_name}::{variant}` expects {} field pattern(s), found {}",
+                                vinfo.fields.len(),
+                                fields.len()
+                            ),
+                        )
+                        .help("provide one subpattern per payload field, in declaration order"),
+                    );
+                }
+                let mut seen_names = HashMap::new();
+                for (sub, (_, fty)) in fields.iter().zip(vinfo.fields.iter()) {
+                    let nested = self.check_pattern(sub, fty);
+                    for (n, t, s) in nested {
+                        if seen_names.insert(n.clone(), ()).is_some()
+                            || bindings.iter().any(|(bn, _, _)| bn == &n)
+                        {
+                            self.diagnostics.push(
+                                Diagnostic::error_at_code(
+                                    s,
+                                    DiagnosticCode::E0312,
+                                    format!(
+                                        "identifier `{n}` is bound more than once in this pattern"
+                                    ),
+                                )
+                                .help("use unique binding names within a pattern"),
+                            );
+                        }
+                        bindings.push((n, t, s));
+                    }
+                }
+            }
+        }
+        bindings
     }
 
     fn check_expr(&mut self, expr: &Expr) -> Type {
         self.check_expr_expected(expr, None)
     }
 
-    fn check_expr_expected(&mut self, expr: &Expr, _expected: Option<&Type>) -> Type {
+    fn check_expr_expected(&mut self, expr: &Expr, expected: Option<&Type>) -> Type {
         let ty = match &expr.kind {
             ExprKind::Int(_) => Type::I64,
             ExprKind::Float(_) => Type::F64,
@@ -760,6 +1271,68 @@ impl<'a> Typechecker<'a> {
                 }
                 Type::Struct(name.clone())
             }
+            ExprKind::EnumConstruct {
+                enum_name,
+                variant,
+                args,
+            } => {
+                self.has_enums = true;
+                let Some(info) = self.enums.get(enum_name).cloned() else {
+                    self.diagnostics.push(
+                        Diagnostic::error_at_code(
+                            expr.span,
+                            DiagnosticCode::E0309,
+                            format!("unknown enum `{enum_name}`"),
+                        )
+                        .help("declare the enum before constructing a variant"),
+                    );
+                    return Type::Unit;
+                };
+                let Some(vinfo) = info.variants.iter().find(|v| v.name == *variant).cloned() else {
+                    self.diagnostics.push(
+                        Diagnostic::error_at_code(
+                            expr.span,
+                            DiagnosticCode::E0309,
+                            format!("enum `{enum_name}` has no variant `{variant}`"),
+                        )
+                        .help("check the variant name spelling"),
+                    );
+                    return Type::Enum(enum_name.clone());
+                };
+                if args.len() != vinfo.fields.len() {
+                    self.diagnostics.push(
+                        Diagnostic::error_at_code(
+                            expr.span,
+                            DiagnosticCode::E0312,
+                            format!(
+                                "variant `{enum_name}::{variant}` expects {} argument(s), found {}",
+                                vinfo.fields.len(),
+                                args.len()
+                            ),
+                        )
+                        .help("pass one argument per payload field, in declaration order"),
+                    );
+                }
+                for (arg, (_, expected)) in args.iter().zip(vinfo.fields.iter()) {
+                    let at = self.check_expr_expected(arg, Some(expected));
+                    if at != *expected && !self.can_coerce(&at, expected) {
+                        self.diagnostics.push(
+                            Diagnostic::error_at_code(
+                                arg.span,
+                                DiagnosticCode::E0312,
+                                format!(
+                                    "argument type mismatch: expected `{}`, found `{}`",
+                                    expected.display(),
+                                    at.display()
+                                ),
+                            )
+                            .help("adjust the argument type to match the variant payload"),
+                        );
+                    }
+                    self.maybe_move_expr(arg);
+                }
+                Type::Enum(enum_name.clone())
+            }
             ExprKind::Cast { expr: inner, ty } => {
                 let from = self.check_expr(inner);
                 let to = self.resolve_type(ty).unwrap_or(from.clone());
@@ -798,13 +1371,312 @@ impl<'a> Typechecker<'a> {
                     }
                 }
             }
-            ExprKind::Index { .. } => {
-                self.diagnostics
-                    .error_at(expr.span, "indexing is not available in Alpha-1.0.0");
-                Type::Unit
+            ExprKind::Index { base, index } => self.check_index(expr, base, index),
+            ExprKind::ArrayLit { elems } => self.check_array_lit(expr, elems, expected),
+            ExprKind::Slice { base, start, end } => {
+                self.check_slice(expr, base, start.as_deref(), end.as_deref())
             }
         };
         ty
+    }
+
+    fn check_array_lit(&mut self, expr: &Expr, elems: &[Expr], expected: Option<&Type>) -> Type {
+        self.has_arrays = true;
+        if elems.is_empty() {
+            match expected {
+                Some(Type::Array { element, len }) if *len == 0 => {
+                    return Type::Array {
+                        element: element.clone(),
+                        len: 0,
+                    };
+                }
+                Some(other) => {
+                    self.diagnostics.push(
+                        Diagnostic::error_at_code(
+                            expr.span,
+                            DiagnosticCode::E0308,
+                            format!(
+                                "empty array literal requires a fixed array type annotation such as `[T; 0]`, found expected `{}`",
+                                other.display()
+                            ),
+                        )
+                        .help("annotate the binding: `let xs: [i64; 0] = []`"),
+                    );
+                    return other.clone();
+                }
+                None => {
+                    self.diagnostics.push(
+                        Diagnostic::error_at_code(
+                            expr.span,
+                            DiagnosticCode::E0308,
+                            "empty array literal requires a type annotation",
+                        )
+                        .help("annotate the binding: `let xs: [i64; 0] = []`"),
+                    );
+                    return Type::Array {
+                        element: Box::new(Type::Unit),
+                        len: 0,
+                    };
+                }
+            }
+        }
+
+        let expected_elem = match expected {
+            Some(Type::Array { element, .. }) => Some(element.as_ref()),
+            _ => None,
+        };
+        let mut elem_ty = expected_elem.cloned().unwrap_or(Type::Unit);
+        for (i, e) in elems.iter().enumerate() {
+            let t = self.check_expr_expected(e, expected_elem);
+            if i == 0 && expected_elem.is_none() {
+                elem_ty = t;
+            } else if t != elem_ty && !self.can_coerce(&t, &elem_ty) {
+                self.diagnostics.push(
+                    Diagnostic::error_at_code(
+                        e.span,
+                        DiagnosticCode::E0308,
+                        format!(
+                            "array element type mismatch: expected `{}`, found `{}`",
+                            elem_ty.display(),
+                            t.display()
+                        ),
+                    )
+                    .help("all elements of an array literal must have the same type"),
+                );
+            }
+        }
+        let lit_len = elems.len();
+        if let Some(Type::Array { len, .. }) = expected {
+            if *len != lit_len {
+                self.diagnostics.push(
+                    Diagnostic::error_at_code(
+                        expr.span,
+                        DiagnosticCode::E0308,
+                        format!(
+                            "array literal length mismatch: expected {len} element(s), found {lit_len}"
+                        ),
+                    )
+                    .help("adjust the literal or the `[T; N]` annotation so lengths match"),
+                );
+            }
+        }
+        Type::Array {
+            element: Box::new(elem_ty),
+            len: lit_len,
+        }
+    }
+
+    fn check_index(&mut self, expr: &Expr, base: &Expr, index: &Expr) -> Type {
+        self.has_arrays = true;
+        let base_ty = self.check_expr(base);
+        let it = self.check_expr(index);
+        if it != Type::I64 {
+            self.diagnostics.push(
+                Diagnostic::error_at_code(
+                    index.span,
+                    DiagnosticCode::E0305,
+                    format!("index must be `i64`, found `{}`", it.display()),
+                )
+                .help("use an `i64` index expression"),
+            );
+        }
+        if let ExprKind::Int(n) = index.kind {
+            if let Some(len) = base_ty.array_len() {
+                if n < 0 || n as usize >= len {
+                    self.diagnostics.push(
+                        Diagnostic::error_at_code(
+                            index.span,
+                            DiagnosticCode::E0306,
+                            format!("index `{n}` is out of bounds for array of length {len}"),
+                        )
+                        .help("use an index in `0..len`"),
+                    );
+                }
+            }
+        }
+        match &base_ty {
+            Type::Array { element, .. } => {
+                if !element.is_copy() {
+                    // Reading an element by value would move; reject and suggest a reference.
+                    self.diagnostics.push(
+                        Diagnostic::error_at_code(
+                            expr.span,
+                            DiagnosticCode::E0307,
+                            format!(
+                                "cannot move element of type `{}` out of an array",
+                                element.display()
+                            ),
+                        )
+                        .help("borrow the element with `&array[i]` or `&mut array[i]`"),
+                    );
+                }
+                *element.clone()
+            }
+            Type::Slice(element) => {
+                if !element.is_copy() {
+                    self.diagnostics.push(
+                        Diagnostic::error_at_code(
+                            expr.span,
+                            DiagnosticCode::E0307,
+                            format!(
+                                "cannot move element of type `{}` out of a slice",
+                                element.display()
+                            ),
+                        )
+                        .help("borrow the element with `&slice[i]` or `&mut slice[i]`"),
+                    );
+                }
+                *element.clone()
+            }
+            Type::Ref { inner, .. } => match inner.as_ref() {
+                Type::Array { element, .. } | Type::Slice(element) => {
+                    if !element.is_copy() {
+                        self.diagnostics.push(
+                            Diagnostic::error_at_code(
+                                expr.span,
+                                DiagnosticCode::E0307,
+                                format!(
+                                    "cannot move element of type `{}` out of a borrowed array or slice",
+                                    element.display()
+                                ),
+                            )
+                            .help("borrow the element instead of moving it"),
+                        );
+                    }
+                    *element.clone()
+                }
+                _ => {
+                    self.diagnostics.push(
+                        Diagnostic::error_at_code(
+                            expr.span,
+                            DiagnosticCode::E0305,
+                            format!("type `{}` cannot be indexed", base_ty.display()),
+                        )
+                        .help("index `[T; N]`, `&[T]`, or `&mut [T]` values"),
+                    );
+                    Type::Unit
+                }
+            },
+            _ => {
+                self.diagnostics.push(
+                    Diagnostic::error_at_code(
+                        expr.span,
+                        DiagnosticCode::E0305,
+                        format!("type `{}` cannot be indexed", base_ty.display()),
+                    )
+                    .note("slicing `str` is not supported in this release")
+                    .help("index `[T; N]`, `&[T]`, or `&mut [T]` values"),
+                );
+                Type::Unit
+            }
+        }
+    }
+
+    fn check_slice(
+        &mut self,
+        expr: &Expr,
+        base: &Expr,
+        start: Option<&Expr>,
+        end: Option<&Expr>,
+    ) -> Type {
+        self.has_arrays = true;
+        let base_ty = self.check_expr(base);
+        let (element, len_opt) = match &base_ty {
+            Type::Array { element, len } => (element.as_ref().clone(), Some(*len)),
+            Type::Slice(element) => (element.as_ref().clone(), None),
+            Type::Ref { inner, .. } => match inner.as_ref() {
+                Type::Array { element, len } => (element.as_ref().clone(), Some(*len)),
+                Type::Slice(element) => (element.as_ref().clone(), None),
+                _ => {
+                    self.diagnostics.push(
+                        Diagnostic::error_at_code(
+                            expr.span,
+                            DiagnosticCode::E0305,
+                            format!("type `{}` cannot be sliced", base_ty.display()),
+                        )
+                        .note("slicing `str` is not supported in this release")
+                        .help("slice `[T; N]`, `&[T]`, or `&mut [T]` values"),
+                    );
+                    return Type::Slice(Box::new(Type::Unit));
+                }
+            },
+            _ => {
+                self.diagnostics.push(
+                    Diagnostic::error_at_code(
+                        expr.span,
+                        DiagnosticCode::E0305,
+                        format!("type `{}` cannot be sliced", base_ty.display()),
+                    )
+                    .note("slicing `str` is not supported in this release")
+                    .help("slice `[T; N]`, `&[T]`, or `&mut [T]` values"),
+                );
+                return Type::Slice(Box::new(Type::Unit));
+            }
+        };
+
+        let mut start_lit: Option<i64> = Some(0);
+        let mut end_lit: Option<i64> = len_opt.map(|l| l as i64);
+
+        if let Some(s) = start {
+            let st = self.check_expr(s);
+            if st != Type::I64 {
+                self.diagnostics.push(
+                    Diagnostic::error_at_code(
+                        s.span,
+                        DiagnosticCode::E0305,
+                        format!("slice start must be `i64`, found `{}`", st.display()),
+                    )
+                    .help("use an `i64` start index"),
+                );
+            }
+            start_lit = match &s.kind {
+                ExprKind::Int(n) => Some(*n),
+                _ => None,
+            };
+        }
+        if let Some(e) = end {
+            let et = self.check_expr(e);
+            if et != Type::I64 {
+                self.diagnostics.push(
+                    Diagnostic::error_at_code(
+                        e.span,
+                        DiagnosticCode::E0305,
+                        format!("slice end must be `i64`, found `{}`", et.display()),
+                    )
+                    .help("use an `i64` end index"),
+                );
+            }
+            end_lit = match &e.kind {
+                ExprKind::Int(n) => Some(*n),
+                _ => None,
+            };
+        }
+
+        if let (Some(s), Some(e)) = (start_lit, end_lit) {
+            if s < 0 || e < 0 || s > e {
+                self.diagnostics.push(
+                    Diagnostic::error_at_code(
+                        expr.span,
+                        DiagnosticCode::E0306,
+                        format!("invalid slice range `{s}..{e}`"),
+                    )
+                    .help("require `0 <= start <= end`"),
+                );
+            } else if let Some(len) = len_opt {
+                if e as usize > len {
+                    self.diagnostics.push(
+                        Diagnostic::error_at_code(
+                            expr.span,
+                            DiagnosticCode::E0306,
+                            format!("slice end `{e}` is out of bounds for array of length {len}"),
+                        )
+                        .help("require `end <= len`"),
+                    );
+                }
+            }
+        }
+
+        Type::Slice(Box::new(element))
     }
 
     fn check_mut_place(&mut self, place: &Expr, span: Span) {
@@ -827,7 +1699,7 @@ impl<'a> Typechecker<'a> {
                     }
                 }
             }
-            ExprKind::Index { base, .. } => {
+            ExprKind::Index { base, .. } | ExprKind::Slice { base, .. } => {
                 self.check_mut_place(base, span);
             }
             ExprKind::Deref { expr } => {
@@ -843,6 +1715,42 @@ impl<'a> Typechecker<'a> {
                     );
                 }
             }
+            _ => {}
+        }
+    }
+
+    fn check_index_assignable(&mut self, base: &Expr, span: Span) {
+        match &base.kind {
+            ExprKind::Name(name) => {
+                if let Some(local) = self.lookup(name) {
+                    if !local.mutable {
+                        self.diagnostics.push(
+                            Diagnostic::error_at_code(
+                                span,
+                                DiagnosticCode::E0302,
+                                format!("cannot assign to element of immutable array `{name}`"),
+                            )
+                            .help(format!(
+                                "declare it as `let mut {name} = ...` if mutation is intended"
+                            )),
+                        );
+                    }
+                }
+            }
+            ExprKind::Deref { expr } => {
+                let t = self.check_expr(expr);
+                if let Type::Ref { mutable: false, .. } = t {
+                    self.diagnostics.push(
+                        Diagnostic::error_at_code(
+                            span,
+                            DiagnosticCode::E0302,
+                            "cannot assign through a shared slice or array reference",
+                        )
+                        .help("use `&mut [T]` when mutation is intended"),
+                    );
+                }
+            }
+            ExprKind::Index { base, .. } => self.check_index_assignable(base, span),
             _ => {}
         }
     }
@@ -905,7 +1813,18 @@ impl<'a> Typechecker<'a> {
             "to_c_string" => {
                 self.has_strings = true;
                 self.has_advanced_ffi = true;
+                self.has_arenas = true;
                 self.expect_arity(name, args, 1, span);
+                if self.arena_depth == 0 {
+                    self.diagnostics.push(
+                        Diagnostic::error_at_code(
+                            span,
+                            DiagnosticCode::E0500,
+                            "`to_c_string` requires an active `arena:` block",
+                        )
+                        .help("wrap the conversion in `arena:` so the resulting `c_string` has a known lifetime"),
+                    );
+                }
                 if let Some(a) = args.first() {
                     let t = self.check_expr(a);
                     if t != Type::Str {
@@ -916,6 +1835,31 @@ impl<'a> Typechecker<'a> {
                     }
                 }
                 Some(Type::CString)
+            }
+            "len" => {
+                self.has_arrays = true;
+                self.expect_arity(name, args, 1, span);
+                if let Some(a) = args.first() {
+                    let t = self.check_expr(a);
+                    let ok = match &t {
+                        Type::Array { .. } | Type::Slice(_) => true,
+                        Type::Ref { inner, .. } => {
+                            matches!(inner.as_ref(), Type::Array { .. } | Type::Slice(_))
+                        }
+                        _ => false,
+                    };
+                    if !ok {
+                        self.diagnostics.push(
+                            Diagnostic::error_at_code(
+                                a.span,
+                                DiagnosticCode::E0305,
+                                format!("`len` expects an array or slice, found `{}`", t.display()),
+                            )
+                            .help("pass `[T; N]`, `&[T]`, or `&mut [T]`"),
+                        );
+                    }
+                }
+                Some(Type::I64)
             }
             _ => None,
         }
@@ -959,7 +1903,17 @@ impl<'a> Typechecker<'a> {
                 }
             }
             Eq | NotEq => {
-                if lt == rt {
+                if matches!(lt, Type::Enum(_)) || matches!(rt, Type::Enum(_)) {
+                    self.diagnostics.push(
+                        Diagnostic::error_at_code(
+                            span,
+                            DiagnosticCode::E0301,
+                            "comparing enums with `==` / `!=` is not supported yet; use `match`",
+                        )
+                        .help("destructure with `match` instead of comparing enum values"),
+                    );
+                    Type::Bool
+                } else if lt == rt {
                     Type::Bool
                 } else {
                     self.diagnostics.error_at(
@@ -1019,12 +1973,18 @@ impl<'a> Typechecker<'a> {
     }
 
     fn maybe_move_expr(&mut self, expr: &Expr) {
-        if let ExprKind::Name(name) = &expr.kind {
-            if let Some(local) = self.lookup_mut(name) {
-                if !local.ty.is_copy() {
-                    local.moved = true;
+        match &expr.kind {
+            ExprKind::Name(name) => {
+                if let Some(local) = self.lookup_mut(name) {
+                    if !local.ty.is_copy() {
+                        local.moved = true;
+                    }
                 }
             }
+            ExprKind::Index { .. } => {
+                // Indexing of non-copy elements is already rejected in check_index.
+            }
+            _ => {}
         }
     }
 

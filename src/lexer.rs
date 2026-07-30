@@ -309,7 +309,14 @@ impl<'a> Lexer<'a> {
             '[' => TokenKind::LBracket,
             ']' => TokenKind::RBracket,
             ',' => TokenKind::Comma,
-            '.' => TokenKind::Dot,
+            '.' => {
+                if self.peek_char() == '.' {
+                    self.bump_char();
+                    TokenKind::DotDot
+                } else {
+                    TokenKind::Dot
+                }
+            }
             ';' => TokenKind::Semi,
             '+' => TokenKind::Plus,
             '%' => TokenKind::Percent,
@@ -481,5 +488,13 @@ mod tests {
         assert!(kinds.contains(&TokenKind::Indent));
         assert!(kinds.contains(&TokenKind::Dedent));
         assert!(kinds.contains(&TokenKind::Fn));
+    }
+
+    #[test]
+    fn lexes_dotdot_and_array_brackets() {
+        let kinds = lex_ok("fn main() -> i64:\n    let a = xs[1..3]\n    return 0\n");
+        assert!(kinds.contains(&TokenKind::LBracket));
+        assert!(kinds.contains(&TokenKind::RBracket));
+        assert!(kinds.contains(&TokenKind::DotDot));
     }
 }

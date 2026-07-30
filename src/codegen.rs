@@ -11,6 +11,8 @@ pub fn emit_llvm(module: &Module, diagnostics: &mut Diagnostics) -> Option<Strin
         diagnostics,
         out: String::new(),
         struct_types: HashMap::new(),
+        enum_types: HashMap::new(),
+        enum_infos: HashMap::new(),
         value_names: HashMap::new(),
         value_types: HashMap::new(),
         ptr_elem: HashMap::new(),
@@ -29,6 +31,8 @@ struct Emitter<'a> {
     diagnostics: &'a mut Diagnostics,
     out: String,
     struct_types: HashMap<String, String>,
+    enum_types: HashMap<String, String>,
+    enum_infos: HashMap<String, crate::typecheck::EnumInfo>,
     value_names: HashMap<ValueId, String>,
     value_types: HashMap<ValueId, Type>,
     ptr_elem: HashMap<ValueId, Type>,
@@ -54,6 +58,11 @@ impl<'a> Emitter<'a> {
         let _ = writeln!(self.out, "declare void @kroa_arena_exit()");
         let _ = writeln!(self.out, "declare ptr @kroa_arena_alloc(i64)");
         let _ = writeln!(self.out, "declare ptr @kroa_str_to_cstr(ptr, i64)");
+        let _ = writeln!(self.out, "declare void @kroa_bounds_panic(i64, i64)");
+        let _ = writeln!(
+            self.out,
+            "declare void @kroa_slice_bounds_panic(i64, i64, i64)"
+        );
         let _ = writeln!(self.out);
 
         for (name, info) in &module.structs {
@@ -63,6 +72,31 @@ impl<'a> Emitter<'a> {
             self.struct_types.insert(name.clone(), lty);
         }
         if !module.structs.is_empty() {
+            let _ = writeln!(self.out);
+        }
+
+        // Snapshot enum infos and reserve type names before emitting bodies
+        // so mutually-referencing enums resolve.
+        let mut enum_names: Vec<_> = module.enums.keys().cloned().collect();
+        enum_names.sort();
+        for name in &enum_names {
+            let info = module.enums.get(name).unwrap().clone();
+            self.enum_infos.insert(name.clone(), info);
+            self.enum_types
+                .insert(name.clone(), format!("%enum.{name}"));
+        }
+        for name in &enum_names {
+            let info = self.enum_infos.get(name).unwrap().clone();
+            let mut parts = vec!["i32".to_string()];
+            for v in &info.variants {
+                for (_, t) in &v.fields {
+                    parts.push(self.ty(t));
+                }
+            }
+            let lty = self.enum_types.get(name).unwrap().clone();
+            let _ = writeln!(self.out, "{lty} = type {{ {} }}", parts.join(", "));
+        }
+        if !module.enums.is_empty() {
             let _ = writeln!(self.out);
         }
 
@@ -499,14 +533,26 @@ impl<'a> Emitter<'a> {
                         let _ = writeln!(self.out, "  {name} = or i1 {v}, false");
                     }
                     Type::I64 | Type::Unit | Type::CChar => {
-                        let _ = writeln!(self.out, "  {name} = add i64 0, 0");
                         let _ = writeln!(self.out, "  {name} = add i64 {v}, 0");
                     }
-                    Type::CString | Type::Ref { .. } => {
+                    Type::CString => {
                         let _ = writeln!(self.out, "  {name} = getelementptr i8, ptr {v}, i64 0");
                     }
-                    Type::Str => {
-                        // Identity move for {ptr, i64}
+                    Type::Ref { inner, .. } => {
+                        if matches!(inner.as_ref(), Type::Slice(_)) {
+                            let p = self.temp();
+                            let _ =
+                                writeln!(self.out, "  {p} = extractvalue {{ ptr, i64 }} {v}, 0");
+                            let _ = writeln!(
+                                self.out,
+                                "  {name} = insertvalue {{ ptr, i64 }} {v}, ptr {p}, 0"
+                            );
+                        } else {
+                            let _ =
+                                writeln!(self.out, "  {name} = getelementptr i8, ptr {v}, i64 0");
+                        }
+                    }
+                    Type::Str | Type::Slice(_) => {
                         let p = self.temp();
                         let _ = writeln!(self.out, "  {p} = extractvalue {{ ptr, i64 }} {v}, 0");
                         let _ = writeln!(
@@ -514,24 +560,32 @@ impl<'a> Emitter<'a> {
                             "  {name} = insertvalue {{ ptr, i64 }} {v}, ptr {p}, 0"
                         );
                     }
-                    Type::Struct(sname) | Type::Named(sname) => {
-                        let sty = self
-                            .struct_types
-                            .get(sname)
-                            .cloned()
-                            .unwrap_or_else(|| format!("%struct.{sname}"));
-                        // Bitcast-free identity via freeze/select style: use insertvalue of field 0
-                        // with correct field type from extract.
+                    Type::Array { .. } => {
+                        let aty = self.ty(&vt);
+                        let _ = writeln!(
+                            self.out,
+                            "  {name} = select i1 true, {aty} {v}, {aty} poison"
+                        );
+                    }
+                    Type::Enum(ename) | Type::Struct(ename) | Type::Named(ename) => {
+                        let sty = if matches!(vt, Type::Enum(_)) {
+                            self.enum_types
+                                .get(ename)
+                                .cloned()
+                                .unwrap_or_else(|| format!("%enum.{ename}"))
+                        } else {
+                            self.struct_types
+                                .get(ename)
+                                .cloned()
+                                .unwrap_or_else(|| format!("%struct.{ename}"))
+                        };
                         let p = self.temp();
                         let _ = writeln!(self.out, "  {p} = extractvalue {sty} {v}, 0");
-                        // We don't know field0 type easily here without struct info; use the
-                        // extracted value's SSA and reinsert — LLVM needs the type. Use opaque:
-                        // `%name = select i1 true, STY %v, STY poison` — valid identity.
                         let _ = writeln!(
                             self.out,
                             "  {name} = select i1 true, {sty} {v}, {sty} poison"
                         );
-                        let _ = p; // keep extract for side-effect-free validation in some pipelines
+                        let _ = p;
                     }
                 }
                 self.value_types.insert(id, vt);
@@ -540,6 +594,15 @@ impl<'a> Emitter<'a> {
                 let id = inst.id.unwrap();
                 let name = self.name_of(id);
                 let p = self.lookup(*place);
+                // Fat-pointer refs (`&[T]`) copy the slice value from the place.
+                if let Type::Ref { inner, .. } = &inst.ty {
+                    if matches!(inner.as_ref(), Type::Slice(_)) {
+                        let _ = writeln!(self.out, "  {name} = load {{ ptr, i64 }}, ptr {p}");
+                        self.value_types.insert(id, inst.ty.clone());
+                        self.ptr_elem.insert(id, *inner.clone());
+                        return;
+                    }
+                }
                 let _ = writeln!(self.out, "  {name} = getelementptr i8, ptr {p}, i64 0");
                 if let Some(elem) = self.ptr_elem.get(place).cloned() {
                     self.ptr_elem.insert(id, elem.clone());
@@ -602,6 +665,413 @@ impl<'a> Emitter<'a> {
                 );
                 self.value_types.insert(id, Type::CString);
             }
+            InstKind::ArrayAgg { elems } => {
+                let id = inst.id.unwrap();
+                let name = self.name_of(id);
+                let arr_ty = self.ty(&inst.ty);
+                let elem_ty = match &inst.ty {
+                    Type::Array { element, .. } => self.ty(element),
+                    _ => "i64".into(),
+                };
+                let mut cur = String::from("poison");
+                for (i, e) in elems.iter().enumerate() {
+                    let en = self.lookup(*e);
+                    let tmp = if i + 1 == elems.len() {
+                        name.clone()
+                    } else {
+                        self.temp()
+                    };
+                    let _ = writeln!(
+                        self.out,
+                        "  {tmp} = insertvalue {arr_ty} {cur}, {elem_ty} {en}, {i}"
+                    );
+                    cur = tmp;
+                }
+                if elems.is_empty() {
+                    let _ = writeln!(
+                        self.out,
+                        "  {name} = select i1 true, {arr_ty} poison, {arr_ty} poison"
+                    );
+                }
+                self.value_types.insert(id, inst.ty.clone());
+            }
+            InstKind::Len { value } => {
+                let id = inst.id.unwrap();
+                let name = self.name_of(id);
+                let vt = self.value_types.get(value).cloned().unwrap_or(Type::I64);
+                let v = self.lookup(*value);
+                match &vt {
+                    Type::Array { len, .. } => {
+                        let _ = writeln!(self.out, "  {name} = add i64 0, {len}");
+                    }
+                    Type::Slice(_) | Type::Str => {
+                        let _ = writeln!(self.out, "  {name} = extractvalue {{ ptr, i64 }} {v}, 1");
+                    }
+                    Type::Ref { inner, .. } if matches!(inner.as_ref(), Type::Slice(_)) => {
+                        let _ = writeln!(self.out, "  {name} = extractvalue {{ ptr, i64 }} {v}, 1");
+                    }
+                    Type::Ref { inner, .. } => match inner.as_ref() {
+                        Type::Array { len, .. } => {
+                            let _ = writeln!(self.out, "  {name} = add i64 0, {len}");
+                        }
+                        _ => {
+                            let loaded = self.temp();
+                            let _ = writeln!(self.out, "  {loaded} = load {{ ptr, i64 }}, ptr {v}");
+                            let _ = writeln!(
+                                self.out,
+                                "  {name} = extractvalue {{ ptr, i64 }} {loaded}, 1"
+                            );
+                        }
+                    },
+                    _ => {
+                        // Pointer to a slice value (alloca of {ptr,i64}).
+                        let loaded = self.temp();
+                        let _ = writeln!(self.out, "  {loaded} = load {{ ptr, i64 }}, ptr {v}");
+                        let _ = writeln!(
+                            self.out,
+                            "  {name} = extractvalue {{ ptr, i64 }} {loaded}, 1"
+                        );
+                    }
+                }
+                self.value_types.insert(id, Type::I64);
+            }
+            InstKind::BoundsCheck { index, len } => {
+                let idx = self.lookup(*index);
+                let ln = self.lookup(*len);
+                let neg = self.temp();
+                let oob = self.temp();
+                let bad = self.temp();
+                let ok_lbl = format!("bounds.ok.{}", self.next_temp);
+                let bad_lbl = format!("bounds.bad.{}", self.next_temp);
+                self.next_temp += 1;
+                let _ = writeln!(self.out, "  {neg} = icmp slt i64 {idx}, 0");
+                let _ = writeln!(self.out, "  {oob} = icmp sge i64 {idx}, {ln}");
+                let _ = writeln!(self.out, "  {bad} = or i1 {neg}, {oob}");
+                let _ = writeln!(self.out, "  br i1 {bad}, label %{bad_lbl}, label %{ok_lbl}");
+                let _ = writeln!(self.out, "{bad_lbl}:");
+                let _ = writeln!(
+                    self.out,
+                    "  call void @kroa_bounds_panic(i64 {idx}, i64 {ln})"
+                );
+                let _ = writeln!(self.out, "  unreachable");
+                let _ = writeln!(self.out, "{ok_lbl}:");
+            }
+            InstKind::SliceBoundsCheck { start, end, len } => {
+                let s = self.lookup(*start);
+                let e = self.lookup(*end);
+                let ln = self.lookup(*len);
+                let s_neg = self.temp();
+                let e_neg = self.temp();
+                let s_gt_e = self.temp();
+                let e_gt_l = self.temp();
+                let t1 = self.temp();
+                let t2 = self.temp();
+                let bad = self.temp();
+                let ok_lbl = format!("slice.ok.{}", self.next_temp);
+                let bad_lbl = format!("slice.bad.{}", self.next_temp);
+                self.next_temp += 1;
+                let _ = writeln!(self.out, "  {s_neg} = icmp slt i64 {s}, 0");
+                let _ = writeln!(self.out, "  {e_neg} = icmp slt i64 {e}, 0");
+                let _ = writeln!(self.out, "  {s_gt_e} = icmp sgt i64 {s}, {e}");
+                let _ = writeln!(self.out, "  {e_gt_l} = icmp sgt i64 {e}, {ln}");
+                let _ = writeln!(self.out, "  {t1} = or i1 {s_neg}, {e_neg}");
+                let _ = writeln!(self.out, "  {t2} = or i1 {s_gt_e}, {e_gt_l}");
+                let _ = writeln!(self.out, "  {bad} = or i1 {t1}, {t2}");
+                let _ = writeln!(self.out, "  br i1 {bad}, label %{bad_lbl}, label %{ok_lbl}");
+                let _ = writeln!(self.out, "{bad_lbl}:");
+                let _ = writeln!(
+                    self.out,
+                    "  call void @kroa_slice_bounds_panic(i64 {s}, i64 {e}, i64 {ln})"
+                );
+                let _ = writeln!(self.out, "  unreachable");
+                let _ = writeln!(self.out, "{ok_lbl}:");
+            }
+            InstKind::ElemPtr { base, index } => {
+                let id = inst.id.unwrap();
+                let name = self.name_of(id);
+                let idx = self.lookup(*index);
+                let base_n = self.lookup(*base);
+                let base_ty = self
+                    .ptr_elem
+                    .get(base)
+                    .cloned()
+                    .or_else(|| self.value_types.get(base).cloned())
+                    .unwrap_or(Type::I64);
+                let (elem_ty, ptr) = match &base_ty {
+                    Type::Array { element, len } => {
+                        let aty = format!("[{len} x {}]", self.ty(element));
+                        let p = self.temp();
+                        let _ = writeln!(
+                            self.out,
+                            "  {p} = getelementptr inbounds {aty}, ptr {base_n}, i64 0, i64 {idx}"
+                        );
+                        (*element.clone(), p)
+                    }
+                    Type::Ref { inner, .. } => match inner.as_ref() {
+                        Type::Array { element, len } => {
+                            let aty = format!("[{len} x {}]", self.ty(element));
+                            let p = self.temp();
+                            let _ = writeln!(
+                                self.out,
+                                "  {p} = getelementptr inbounds {aty}, ptr {base_n}, i64 0, i64 {idx}"
+                            );
+                            (element.as_ref().clone(), p)
+                        }
+                        Type::Slice(element) => {
+                            // Fat-pointer ref value in SSA.
+                            let data = self.temp();
+                            let p = self.temp();
+                            let et = self.ty(element);
+                            let _ = writeln!(
+                                self.out,
+                                "  {data} = extractvalue {{ ptr, i64 }} {base_n}, 0"
+                            );
+                            let _ = writeln!(
+                                self.out,
+                                "  {p} = getelementptr inbounds {et}, ptr {data}, i64 {idx}"
+                            );
+                            (element.as_ref().clone(), p)
+                        }
+                        other => (other.clone(), base_n),
+                    },
+                    Type::Slice(element) => {
+                        // base is a slice value in SSA.
+                        let data = self.temp();
+                        let p = self.temp();
+                        let et = self.ty(element);
+                        let _ = writeln!(
+                            self.out,
+                            "  {data} = extractvalue {{ ptr, i64 }} {base_n}, 0"
+                        );
+                        let _ = writeln!(
+                            self.out,
+                            "  {p} = getelementptr inbounds {et}, ptr {data}, i64 {idx}"
+                        );
+                        (*element.clone(), p)
+                    }
+                    _ => {
+                        // Assume pointer to slice aggregate.
+                        let loaded = self.temp();
+                        let data = self.temp();
+                        let p = self.temp();
+                        let et = match &inst.ty {
+                            Type::Ref { inner, .. } => self.ty(inner),
+                            _ => "i64".into(),
+                        };
+                        let _ =
+                            writeln!(self.out, "  {loaded} = load {{ ptr, i64 }}, ptr {base_n}");
+                        let _ = writeln!(
+                            self.out,
+                            "  {data} = extractvalue {{ ptr, i64 }} {loaded}, 0"
+                        );
+                        let _ = writeln!(
+                            self.out,
+                            "  {p} = getelementptr inbounds {et}, ptr {data}, i64 {idx}"
+                        );
+                        (Type::I64, p)
+                    }
+                };
+                let _ = writeln!(self.out, "  {name} = getelementptr i8, ptr {ptr}, i64 0");
+                self.ptr_elem.insert(id, elem_ty.clone());
+                self.value_types.insert(
+                    id,
+                    Type::Ref {
+                        mutable: true,
+                        inner: Box::new(elem_ty),
+                    },
+                );
+            }
+            InstKind::SliceFrom { base, start, end } => {
+                let id = inst.id.unwrap();
+                let name = self.name_of(id);
+                let s = self.lookup(*start);
+                let e = self.lookup(*end);
+                let base_n = self.lookup(*base);
+                let base_ty = self
+                    .ptr_elem
+                    .get(base)
+                    .cloned()
+                    .or_else(|| self.value_types.get(base).cloned())
+                    .unwrap_or(Type::I64);
+                let len_tmp = self.temp();
+                let _ = writeln!(self.out, "  {len_tmp} = sub i64 {e}, {s}");
+                let data_ptr = match &base_ty {
+                    Type::Array { element, len } => {
+                        let aty = format!("[{len} x {}]", self.ty(element));
+                        let p = self.temp();
+                        let _ = writeln!(
+                            self.out,
+                            "  {p} = getelementptr inbounds {aty}, ptr {base_n}, i64 0, i64 {s}"
+                        );
+                        p
+                    }
+                    Type::Ref { inner, .. } => match inner.as_ref() {
+                        Type::Array { element, len } => {
+                            let aty = format!("[{len} x {}]", self.ty(element));
+                            let p = self.temp();
+                            let _ = writeln!(
+                                self.out,
+                                "  {p} = getelementptr inbounds {aty}, ptr {base_n}, i64 0, i64 {s}"
+                            );
+                            p
+                        }
+                        Type::Slice(element) => {
+                            let data = self.temp();
+                            let p = self.temp();
+                            let et = self.ty(element);
+                            let _ = writeln!(
+                                self.out,
+                                "  {data} = extractvalue {{ ptr, i64 }} {base_n}, 0"
+                            );
+                            let _ = writeln!(
+                                self.out,
+                                "  {p} = getelementptr inbounds {et}, ptr {data}, i64 {s}"
+                            );
+                            p
+                        }
+                        _ => base_n,
+                    },
+                    Type::Slice(element) => {
+                        let data = self.temp();
+                        let p = self.temp();
+                        let et = self.ty(element);
+                        let _ = writeln!(
+                            self.out,
+                            "  {data} = extractvalue {{ ptr, i64 }} {base_n}, 0"
+                        );
+                        let _ = writeln!(
+                            self.out,
+                            "  {p} = getelementptr inbounds {et}, ptr {data}, i64 {s}"
+                        );
+                        p
+                    }
+                    _ => {
+                        let loaded = self.temp();
+                        let data = self.temp();
+                        let p = self.temp();
+                        let _ =
+                            writeln!(self.out, "  {loaded} = load {{ ptr, i64 }}, ptr {base_n}");
+                        let _ = writeln!(
+                            self.out,
+                            "  {data} = extractvalue {{ ptr, i64 }} {loaded}, 0"
+                        );
+                        let _ = writeln!(
+                            self.out,
+                            "  {p} = getelementptr inbounds i64, ptr {data}, i64 {s}"
+                        );
+                        p
+                    }
+                };
+                let _ = writeln!(
+                    self.out,
+                    "  {name} = insertvalue {{ ptr, i64 }} {{ ptr poison, i64 0 }}, ptr {data_ptr}, 0"
+                );
+                let name2 = self.temp();
+                let _ = writeln!(
+                    self.out,
+                    "  {name2} = insertvalue {{ ptr, i64 }} {name}, i64 {len_tmp}, 1"
+                );
+                // Rename: replace value name mapping to final slice.
+                self.value_names.insert(id, name2);
+                self.value_types.insert(id, inst.ty.clone());
+            }
+            InstKind::EnumConstruct {
+                enum_name,
+                variant_index,
+                fields,
+            } => {
+                let id = inst.id.unwrap();
+                let name = self.name_of(id);
+                let ety = self
+                    .enum_types
+                    .get(enum_name)
+                    .cloned()
+                    .unwrap_or_else(|| format!("%enum.{enum_name}"));
+                if fields.is_empty() {
+                    let _ = writeln!(
+                        self.out,
+                        "  {name} = insertvalue {ety} poison, i32 {variant_index}, 0"
+                    );
+                } else {
+                    let mut cur = self.temp();
+                    let _ = writeln!(
+                        self.out,
+                        "  {cur} = insertvalue {ety} poison, i32 {variant_index}, 0"
+                    );
+                    let info = self.enum_infos.get(enum_name).cloned();
+                    for (fi, field_val) in fields.iter().enumerate() {
+                        let llvm_idx = self.enum_payload_index(enum_name, *variant_index, fi);
+                        let fty = info
+                            .as_ref()
+                            .and_then(|inf| {
+                                inf.variants
+                                    .get(*variant_index)
+                                    .and_then(|v| v.fields.get(fi).map(|(_, t)| t.clone()))
+                            })
+                            .unwrap_or(Type::I64);
+                        let ft = self.ty(&fty);
+                        let fv = self.lookup(*field_val);
+                        let tmp = if fi + 1 == fields.len() {
+                            name.clone()
+                        } else {
+                            self.temp()
+                        };
+                        let _ = writeln!(
+                            self.out,
+                            "  {tmp} = insertvalue {ety} {cur}, {ft} {fv}, {llvm_idx}"
+                        );
+                        cur = tmp;
+                    }
+                }
+                self.value_types.insert(id, inst.ty.clone());
+            }
+            InstKind::EnumTag { value } => {
+                let id = inst.id.unwrap();
+                let name = self.name_of(id);
+                let v = self.lookup(*value);
+                let vt = self.value_types.get(value).cloned().unwrap_or(Type::I64);
+                let ety = match &vt {
+                    Type::Enum(n) => self
+                        .enum_types
+                        .get(n)
+                        .cloned()
+                        .unwrap_or_else(|| format!("%enum.{n}")),
+                    _ => self.ty(&vt),
+                };
+                let tag32 = self.temp();
+                let _ = writeln!(self.out, "  {tag32} = extractvalue {ety} {v}, 0");
+                let _ = writeln!(self.out, "  {name} = zext i32 {tag32} to i64");
+                self.value_types.insert(id, Type::I64);
+            }
+            InstKind::EnumField {
+                value,
+                variant_index,
+                field_index,
+            } => {
+                let id = inst.id.unwrap();
+                let name = self.name_of(id);
+                let v = self.lookup(*value);
+                let vt = self
+                    .value_types
+                    .get(value)
+                    .cloned()
+                    .unwrap_or(inst.ty.clone());
+                let (ename, ety) = match &vt {
+                    Type::Enum(n) => (
+                        n.clone(),
+                        self.enum_types
+                            .get(n)
+                            .cloned()
+                            .unwrap_or_else(|| format!("%enum.{n}")),
+                    ),
+                    _ => (String::new(), self.ty(&vt)),
+                };
+                let llvm_idx = self.enum_payload_index(&ename, *variant_index, *field_index);
+                let fty = self.ty(&inst.ty);
+                let _ = writeln!(self.out, "  {name} = extractvalue {ety} {v}, {llvm_idx}");
+                let _ = fty;
+                self.value_types.insert(id, inst.ty.clone());
+            }
         }
     }
 
@@ -633,6 +1103,22 @@ impl<'a> Emitter<'a> {
                     then_block.0, else_block.0
                 );
             }
+            Terminator::Switch {
+                discr,
+                cases,
+                default,
+            } => {
+                let d = self.lookup(*discr);
+                let mut arms = String::new();
+                for (tag, bid) in cases {
+                    arms.push_str(&format!(" i64 {tag}, label %block_{}", bid.0));
+                }
+                let _ = writeln!(
+                    self.out,
+                    "  switch i64 {d}, label %block_{} [{arms} ]",
+                    default.0
+                );
+            }
             Terminator::Unreachable => {
                 let _ = writeln!(self.out, "  unreachable");
             }
@@ -644,15 +1130,44 @@ impl<'a> Emitter<'a> {
             Type::I64 | Type::Unit | Type::CChar => "i64".into(),
             Type::F64 => "double".into(),
             Type::Bool => "i1".into(),
-            Type::Str => "{ ptr, i64 }".into(),
+            Type::Str | Type::Slice(_) => "{ ptr, i64 }".into(),
             Type::CString => "ptr".into(),
             Type::Named(n) | Type::Struct(n) => self
                 .struct_types
                 .get(n)
                 .cloned()
                 .unwrap_or_else(|| format!("%struct.{n}")),
+            Type::Enum(n) => self
+                .enum_types
+                .get(n)
+                .cloned()
+                .unwrap_or_else(|| format!("%enum.{n}")),
+            // `&[T]` / `&mut [T]` are fat pointers, like `str`.
+            Type::Ref { inner, .. } if matches!(inner.as_ref(), Type::Slice(_)) => {
+                "{ ptr, i64 }".into()
+            }
             Type::Ref { .. } => "ptr".into(),
+            Type::Array { element, len } => format!("[{len} x {}]", self.ty(element)),
         }
+    }
+
+    fn enum_payload_index(
+        &self,
+        enum_name: &str,
+        variant_index: usize,
+        field_index: usize,
+    ) -> usize {
+        let Some(info) = self.enum_infos.get(enum_name) else {
+            return 1 + field_index;
+        };
+        let mut idx = 1usize; // tag at 0
+        for (i, v) in info.variants.iter().enumerate() {
+            if i == variant_index {
+                return idx + field_index;
+            }
+            idx += v.fields.len();
+        }
+        idx + field_index
     }
 
     fn ret_ty(&self, t: &Type) -> String {

@@ -160,6 +160,10 @@ Rules in short:
 
 - A reference cannot outlive the value it points to.
 - You cannot have a mutable borrow together with other borrows of the same value.
+- Loans end at the last use of the reference (NLL-lite), so sequential non-overlapping `&mut` borrows are allowed.
+
+See the [borrow checker technical guide](borrow-checker.md) for the complete
+CFG, liveness, join, place, carrier, and arena-provenance algorithm.
 
 ## Strings and C
 

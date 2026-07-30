@@ -1,0 +1,8 @@
+# Kroa maintainers
+* @c1vrol
+
+# Release and CI
+/.github/ @c1vrol
+/Cargo.toml @c1vrol
+/CHANGELOG.md @c1vrol
+/PROJECT_STATUS.md @c1vrol

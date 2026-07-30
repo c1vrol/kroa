@@ -11,6 +11,7 @@ pub struct Program {
 pub enum Item {
     Function(Function),
     Struct(StructDef),
+    Enum(EnumDef),
     Extern(ExternFn),
 }
 
@@ -19,6 +20,20 @@ pub struct StructDef {
     pub name: String,
     pub fields: Vec<Field>,
     pub is_c_repr: bool,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct EnumDef {
+    pub name: String,
+    pub variants: Vec<VariantDef>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct VariantDef {
+    pub name: String,
+    pub fields: Vec<Field>,
     pub span: Span,
 }
 
@@ -100,6 +115,36 @@ pub enum Stmt {
         body: Block,
         span: Span,
     },
+    Match {
+        scrutinee: Expr,
+        arms: Vec<MatchArm>,
+        span: Span,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct MatchArm {
+    pub pattern: Pattern,
+    pub body: Block,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct Pattern {
+    pub kind: PatternKind,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub enum PatternKind {
+    Wildcard,
+    Binding(String),
+    Bool(bool),
+    Variant {
+        enum_name: String,
+        variant: String,
+        fields: Vec<Pattern>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -136,6 +181,11 @@ pub enum ExprKind {
         name: String,
         fields: Vec<(String, Expr)>,
     },
+    EnumConstruct {
+        enum_name: String,
+        variant: String,
+        args: Vec<Expr>,
+    },
     Cast {
         expr: Box<Expr>,
         ty: TypeExpr,
@@ -150,6 +200,16 @@ pub enum ExprKind {
     Index {
         base: Box<Expr>,
         index: Box<Expr>,
+    },
+    /// Array literal: `[e1, e2, ...]`
+    ArrayLit {
+        elems: Vec<Expr>,
+    },
+    /// Slice of an array or slice place: `base[start..end]` with optional bounds.
+    Slice {
+        base: Box<Expr>,
+        start: Option<Box<Expr>>,
+        end: Option<Box<Expr>>,
     },
 }
 
@@ -186,7 +246,19 @@ pub struct TypeExpr {
 pub enum TypeExprKind {
     Named(String),
     Unit,
-    Ref { mutable: bool, inner: Box<TypeExpr> },
+    Ref {
+        mutable: bool,
+        inner: Box<TypeExpr>,
+    },
+    /// Fixed-size array type: `[T; N]`
+    Array {
+        elem: Box<TypeExpr>,
+        len: i64,
+    },
+    /// Unsized slice type: `[T]` (only valid behind `&` / `&mut`)
+    Slice {
+        elem: Box<TypeExpr>,
+    },
 }
 
 impl TypeExpr {

@@ -2,17 +2,10 @@
 
 > Living project summary. Update this file with every Kroa release.
 
-**Current version:** Alpha-1.0.0 (`A-1.0.0`)  
-**Cargo version:** `1.0.0-alpha`  
+**Current version:** Alpha-2.0.0 (`A-2.0.0`)  
+**Cargo version:** `2.0.0-alpha`  
 **Release date:** July 30, 2026  
 **Status:** Alpha — functional compiler MVP, not production-ready
-
-> **Reconstruction notice / Aviso de reconstrucción:** this A-1.0.0 tree was
-> reconstructed from the historical specification because no recoverable Git
-> history existed. It is not an originally preserved release tarball. / Este
-> árbol A-1.0.0 fue reconstruido desde la especificación histórica porque no
-> existía historial Git recuperable. No es un tarball original preservado.
-> See / Véase [`RECONSTRUCTION.md`](RECONSTRUCTION.md).
 
 - [Resumen en español](#resumen-en-español)
 - [English summary](#english-summary)
@@ -32,15 +25,15 @@ A-MAJOR.MINOR.PATCH
 Para la versión actual:
 
 ```text
-A-1.0.0
+A-2.0.0
 ```
 
 - `A` significa **Alpha**: el lenguaje funciona, pero su sintaxis, ABI y herramientas todavía pueden cambiar.
-- `MAJOR` (`1`) aumenta cuando hay una evolución grande del lenguaje, su arquitectura o compatibilidad.
+- `MAJOR` (`2`) aumenta cuando hay una evolución grande del lenguaje, su arquitectura o compatibilidad.
 - `MINOR` (`.0`) aumenta al añadir características pequeñas o compatibles dentro de la misma versión mayor.
 - `PATCH` (`.0`) aumenta al corregir bugs sin introducir características importantes.
 
-Cargo requiere una versión compatible con SemVer, por lo que `A-1.0.0` se representa internamente como `1.0.0-alpha`.
+Cargo requiere una versión compatible con SemVer, por lo que `A-2.0.0` se representa internamente como `2.0.0-alpha`.
 
 ## Objetivo de Kroa
 
@@ -163,9 +156,10 @@ arena:
 - `&mut T` crea una referencia mutable exclusiva.
 - No puede coexistir un préstamo mutable con otro préstamo del mismo lugar.
 - No se puede mover un valor mientras está prestado.
-- No se debe devolver una referencia que apunte a una arena local.
+- No se puede devolver una referencia a almacenamiento local ni un puntero
+  respaldado por una arena local.
 
-El borrow checker actual es una primera implementación sobre el CFG. Todavía debe endurecerse antes de considerar Kroa apto para producción.
+El borrow checker usa análisis NLL-lite sobre el CFG: préstamos múltiples por lugar, muerte en el último uso de la referencia (incluidos locales que la almacenan), join en ramas/bucles y provenance de arena. Todavía no es el modelo completo de Rust; falta cobertura fina de escapes y aliasing avanzado antes de producción.
 
 ## FFI con C
 
@@ -293,13 +287,11 @@ La documentación educativa está disponible en inglés y español:
 
 - Es un MVP Alpha, no un compilador listo para producción.
 - La sintaxis y la ABI todavía pueden cambiar.
-- El borrow checker es conservador y todavía no cubre todos los casos de flujo.
+- El borrow checker es NLL-lite (último uso + join CFG); aún no cubre todos los casos de escape/aliasing de un checker completo.
 - Las arenas usan un runtime mínimo y aún no ofrecen una API pública completa de asignación tipada.
 - Los errores externos de Clang no se traducen todavía a todos los códigos Kroa específicos.
 - No hay módulos, imports, gestor de paquetes, formatter ni LSP.
 - No hay arreglos, slicing, pattern matching, enums con datos ni genéricos.
-- No hay NLL: el borrow checker inicial conserva préstamos léxicos y no los
-  termina automáticamente en el último uso.
 - No existe todavía una biblioteca estándar general.
 - La configuración LLVM/triple y la compatibilidad multiplataforma necesitan más trabajo.
 - La FFI no puede garantizar la seguridad del código C externo.
@@ -331,9 +323,19 @@ En cada update:
 
 ## Historial
 
+### Alpha-2.0.0 — July 30, 2026
+
+Evolución mayor del lenguaje:
+
+- arrays fijos `[T; N]` y slices seguros `&[T]` / `&mut [T]`;
+- enums con `match` / `case` y comprobación de exhaustividad;
+- borrow checker NLL-lite (último uso, joins CFG, multi-loan, reborrows);
+- análisis de escape para referencias locales y `c_string` de arena;
+- documentación técnica del borrow checker y proceso profesional con entornos `development` / `production`.
+
 ### Alpha-1.0.0 — July 30, 2026
 
-Primera versión Alpha documentada:
+Primera versión Alpha documentada (reconstruida; ver `RECONSTRUCTION.md`):
 
 - pipeline completo hasta ejecutable nativo;
 - lexer y parser por indentación;
@@ -353,7 +355,7 @@ Primera versión Alpha documentada:
 
 ## Version
 
-Current release: **Alpha-1.0.0 (`A-1.0.0`)**, represented as `1.0.0-alpha` in Cargo.
+Current release: **Alpha-2.0.0 (`A-2.0.0`)**, represented as `2.0.0-alpha` in Cargo.
 
 Version format:
 
@@ -382,10 +384,7 @@ A-MAJOR.MINOR.PATCH
 
 ## Main limitations
 
-Kroa is not production-ready. Arrays, slices, enums, pattern matching, NLL-style
-last-use loan shortening, modules, generics, package management, and editor
-integration are not implemented. The initial lexical borrow checker, arena API,
-standard library, platform support, and tooling remain incomplete.
+Kroa is not production-ready. The arena API, standard library, platform support, tooling, modules, generics, package management, and editor integration remain incomplete. The borrow checker is NLL-lite rather than a full region system.
 
 ## Update rule
 
@@ -393,6 +392,10 @@ Every release must update this file’s version, date, history, capabilities, te
 
 ## Release history
 
+### Alpha-2.0.0 — July 30, 2026
+
+Major language evolution adding fixed arrays and safe slices, enums with `match`/`case`, NLL-lite borrow checking, local/arena escape analysis, borrow-checker documentation, and a professional development/production release workflow.
+
 ### Alpha-1.0.0 — July 30, 2026
 
-First documented Alpha release containing the native compiler pipeline, Kroa IR, static types, structs, arenas, initial borrowing, C FFI, agent-oriented diagnostics, examples, tests, and bilingual documentation.
+First documented Alpha release (reconstructed; see `RECONSTRUCTION.md`) containing the native compiler pipeline, Kroa IR, static types, structs, arenas, initial borrowing, C FFI, agent-oriented diagnostics, examples, tests, and bilingual documentation.

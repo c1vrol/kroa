@@ -96,7 +96,8 @@ Inference is **local**:
 1. **Shared XOR mutable:** many `&T`, or one `&mut T`, never both on the same place.
 2. **No move while borrowed.**
 3. **No assign through a place while it is shared-borrowed.**
-4. **Arena lifetimes:** memory from `arena:` dies when the block ends (including early `return`). Never return a reference into an arena.
+4. **Local and arena lifetimes:** local storage dies when its function ends, and memory from `arena:` dies when the block ends (including early `return`). Return owned values or caller-provided references, never references to local storage or arena-backed pointers.
+5. **NLL-lite:** a loan ends at the last use of the reference (including the local that stores it), not at the end of the enclosing lexical block. Sequential non-overlapping `&mut` borrows of the same place are allowed.
 
 ## 5. Diagnostics for auto-fix loops
 
@@ -134,7 +135,7 @@ Each diagnostic is one JSON object (NDJSON) with fields:
 | `E0400` | borrow conflict |
 | `E0401` | assign while borrowed |
 | `E0402` | move while borrowed |
-| `E0403` | reference escapes arena |
+| `E0403` | local reference or arena-backed pointer escapes |
 | `E0404` | arena enter/exit mismatch |
 | `E0500` | FFI/unsafe boundary |
 

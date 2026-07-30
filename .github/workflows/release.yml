@@ -1,0 +1,146 @@
+name: Production release
+
+on:
+  push:
+    tags:
+      - "A-*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: production-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate-tag:
+    name: Validate tag and Cargo version
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      cargo_version: ${{ steps.meta.outputs.cargo_version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Extract and validate versions
+        id: meta
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          if [[ ! "${TAG}" =~ ^A-[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Tag must match A-MAJOR.MINOR.PATCH"
+            exit 1
+          fi
+          CARGO_VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+          EXPECTED="${TAG#A-}-alpha"
+          echo "cargo_version=${CARGO_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG} cargo=${CARGO_VERSION} expected=${EXPECTED}"
+          if [[ "${CARGO_VERSION}" != "${EXPECTED}" ]]; then
+            echo "Cargo.toml version (${CARGO_VERSION}) must equal ${EXPECTED} for tag ${TAG}"
+            exit 1
+          fi
+
+  build:
+    name: Build production binaries
+    needs: validate-tag
+    runs-on: ${{ matrix.os }}
+    environment: production
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target_name: kroa-linux-x86_64
+            binary: kroa
+          - os: windows-latest
+            target_name: kroa-windows-x86_64
+            binary: kroa.exe
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install LLVM/Clang (Ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm
+
+      - name: Install LLVM/Clang (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          choco install llvm --yes --no-progress
+          echo "C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Package Linux release
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p dist
+          cp "target/release/${{ matrix.binary }}" dist/
+          cp README.md CHANGELOG.md LICENSE PROJECT_STATUS.md dist/
+          (cd dist && sha256sum "${{ matrix.binary }}" > SHA256SUMS.txt)
+          tar -C dist -czf "${{ matrix.target_name }}-${{ needs.validate-tag.outputs.tag }}.tar.gz" \
+            "${{ matrix.binary }}" README.md CHANGELOG.md LICENSE PROJECT_STATUS.md SHA256SUMS.txt
+
+      - name: Package Windows release
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path dist -Force | Out-Null
+          Copy-Item "target/release/${{ matrix.binary }}" dist/
+          Copy-Item README.md,CHANGELOG.md,LICENSE,PROJECT_STATUS.md dist/
+          $hash = (Get-FileHash "dist/${{ matrix.binary }}" -Algorithm SHA256).Hash.ToLower()
+          "SHA256 (${{ matrix.binary }}) = $hash" | Set-Content dist/SHA256SUMS.txt
+          Compress-Archive -Path dist/* -DestinationPath "${{ matrix.target_name }}-${{ needs.validate-tag.outputs.tag }}.zip"
+
+      - name: Upload release asset staging
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target_name }}
+          path: |
+            *.tar.gz
+            *.zip
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    needs: [validate-tag, build]
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download staged assets
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Create production release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.validate-tag.outputs.tag }}
+          name: Kroa ${{ needs.validate-tag.outputs.tag }}
+          draft: false
+          prerelease: true
+          generate_release_notes: true
+          body: |
+            Production Alpha release `${{ needs.validate-tag.outputs.tag }}`
+            (Cargo `${{ needs.validate-tag.outputs.cargo_version }}`).
+
+            See `CHANGELOG.md` and `PROJECT_STATUS.md` for details.
+            Development artifacts from the `develop` branch are not production releases.
+          files: |
+            release-assets/**
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

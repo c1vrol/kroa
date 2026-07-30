@@ -61,6 +61,7 @@ pub fn lower(typed: &TypedProgram, diagnostics: &mut Diagnostics) -> Module {
 
     Module {
         structs: typed.structs.clone(),
+        enums: typed.enums.clone(),
         functions,
         externs,
     }
@@ -87,6 +88,10 @@ struct FunctionBuilder<'a> {
     next_block: u32,
     scopes: Vec<HashMap<String, LocalSlot>>,
     arena_depth: u32,
+    /// Alias roots for locals that hold references/slices into another place.
+    slot_alias_roots: HashMap<ValueId, ValueId>,
+    /// Alias root produced by the most recent `lower_ref`, if any.
+    last_alias_root: Option<ValueId>,
     /// True when control flow has fully diverged (all paths returned).
     sealed: bool,
 }
@@ -128,6 +133,8 @@ impl<'a> FunctionBuilder<'a> {
             next_block: 1,
             scopes: vec![HashMap::new()],
             arena_depth: 0,
+            slot_alias_roots: HashMap::new(),
+            last_alias_root: None,
             sealed: false,
         };
 
@@ -178,11 +185,27 @@ impl<'a> FunctionBuilder<'a> {
             Stmt::Let {
                 name,
                 mutable,
+                ty: ty_ann,
                 value,
                 span,
-                ..
             } => {
-                let (vid, ty) = self.lower_expr(value);
+                let (vid, ty) = if let (Some(ann), ExprKind::ArrayLit { elems }) =
+                    (ty_ann.as_ref(), &value.kind)
+                {
+                    if elems.is_empty() {
+                        let to = self.resolve_type_expr(ann);
+                        let id = self.push_valued(
+                            to.clone(),
+                            InstKind::ArrayAgg { elems: vec![] },
+                            *span,
+                        );
+                        (id, to)
+                    } else {
+                        self.lower_expr(value)
+                    }
+                } else {
+                    self.lower_expr(value)
+                };
                 let ptr = self.alloca(ty.clone(), *span);
                 let moved = if ty.is_copy() {
                     vid
@@ -190,6 +213,9 @@ impl<'a> FunctionBuilder<'a> {
                     self.push_valued(ty.clone(), InstKind::Move { value: vid }, *span)
                 };
                 self.push_store(ptr, moved, *span);
+                if let Some(root) = self.last_alias_root.take() {
+                    self.slot_alias_roots.insert(ptr, root);
+                }
                 self.declare(
                     name,
                     LocalSlot {
@@ -204,11 +230,17 @@ impl<'a> FunctionBuilder<'a> {
                 value,
                 span,
             } => {
+                self.last_alias_root = None;
                 let (vid, _) = self.lower_expr(value);
                 match &target.kind {
                     ExprKind::Name(name) => {
                         if let Some(local) = self.lookup(name).cloned() {
                             self.push_store(local.ptr, vid, *span);
+                            if let Some(root) = self.last_alias_root.take() {
+                                self.slot_alias_roots.insert(local.ptr, root);
+                            } else {
+                                self.slot_alias_roots.remove(&local.ptr);
+                            }
                         }
                     }
                     ExprKind::Field { base, field } => {
@@ -243,6 +275,31 @@ impl<'a> FunctionBuilder<'a> {
                         let (ptr, _) = self.lower_expr(expr);
                         self.push_store(ptr, vid, *span);
                     }
+                    ExprKind::Index { base, index } => {
+                        let (base_val, base_ty, root) = self.lower_index_base(base);
+                        let (idx, _) = self.lower_expr(index);
+                        let len = self.push_len_of(&base_ty, base_val, *span);
+                        self.push_inst(
+                            Type::Unit,
+                            InstKind::BoundsCheck { index: idx, len },
+                            *span,
+                        );
+                        let elem_ptr = self.push_valued(
+                            Type::Ref {
+                                mutable: true,
+                                inner: Box::new(
+                                    base_ty.element_type().cloned().unwrap_or(Type::Unit),
+                                ),
+                            },
+                            InstKind::ElemPtr {
+                                base: base_val,
+                                index: idx,
+                            },
+                            *span,
+                        );
+                        let _ = root;
+                        self.push_store(elem_ptr, vid, *span);
+                    }
                     _ => {
                         self.diagnostics
                             .error_at(*span, "unsupported assignment target in lowering");
@@ -253,16 +310,19 @@ impl<'a> FunctionBuilder<'a> {
                 let _ = self.lower_expr(expr);
             }
             Stmt::Return { value, span } => {
-                // Exit all open arenas before returning.
-                for _ in 0..self.arena_depth {
-                    self.push_inst(Type::Unit, InstKind::ArenaExit, *span);
-                }
+                // Evaluate the return value while every enclosing arena is still
+                // alive. The borrow checker can then retain its provenance and
+                // reject an escaping arena-backed pointer.
                 let ret = if let Some(v) = value {
                     let (vid, _) = self.lower_expr(v);
                     Some(vid)
                 } else {
                     None
                 };
+                // Exit all open arenas before returning.
+                for _ in 0..self.arena_depth {
+                    self.push_inst(Type::Unit, InstKind::ArenaExit, *span);
+                }
                 self.set_term(Terminator::Return(ret));
             }
             Stmt::If {
@@ -281,13 +341,17 @@ impl<'a> FunctionBuilder<'a> {
                 });
 
                 self.switch_to(then_id);
+                let depth_before_then = self.arena_depth;
                 self.lower_block_stmts(then_block);
+                self.arena_depth = depth_before_then;
                 let then_term = self.current_terminated();
 
                 self.switch_to(else_id);
+                let depth_before_else = self.arena_depth;
                 if let Some(e) = else_block {
                     self.lower_block_stmts(e);
                 }
+                self.arena_depth = depth_before_else;
                 let else_term = self.current_terminated();
 
                 if then_term && else_term {
@@ -321,7 +385,9 @@ impl<'a> FunctionBuilder<'a> {
                 });
 
                 self.switch_to(body_id);
+                let depth_before_body = self.arena_depth;
                 self.lower_block_stmts(body);
+                self.arena_depth = depth_before_body;
                 if !self.current_terminated() {
                     self.set_term(Terminator::Jump(header));
                 }
@@ -340,6 +406,194 @@ impl<'a> FunctionBuilder<'a> {
             }
             Stmt::Unsafe { body, .. } => {
                 self.lower_block_stmts(body);
+            }
+            Stmt::Match {
+                scrutinee,
+                arms,
+                span,
+            } => {
+                self.lower_match(scrutinee, arms, *span);
+            }
+        }
+    }
+
+    fn lower_match(&mut self, scrutinee: &Expr, arms: &[crate::ast::MatchArm], span: Span) {
+        let (scrut_val, scrut_ty) = self.lower_expr(scrutinee);
+        let moved = if scrut_ty.is_copy() {
+            scrut_val
+        } else {
+            self.push_valued(scrut_ty.clone(), InstKind::Move { value: scrut_val }, span)
+        };
+
+        let tag = match &scrut_ty {
+            Type::Enum(_) => self.push_valued(Type::I64, InstKind::EnumTag { value: moved }, span),
+            Type::Bool => self.push_valued(
+                Type::I64,
+                InstKind::Cast {
+                    value: moved,
+                    to: Type::I64,
+                },
+                span,
+            ),
+            _ => self.push_valued(Type::I64, InstKind::ConstI64(0), span),
+        };
+
+        let mut arm_blocks = Vec::new();
+        let mut cases = Vec::new();
+
+        for (i, arm) in arms.iter().enumerate() {
+            let bid = self.new_block(&format!("match.arm{i}"));
+            arm_blocks.push(bid);
+            match &arm.pattern.kind {
+                crate::ast::PatternKind::Variant {
+                    enum_name, variant, ..
+                } => {
+                    if let Some(info) = self.typed.enums.get(enum_name) {
+                        if let Some(v) = info.variants.iter().find(|v| v.name == *variant) {
+                            cases.push((v.tag, bid));
+                        }
+                    }
+                }
+                crate::ast::PatternKind::Bool(true) => cases.push((1, bid)),
+                crate::ast::PatternKind::Bool(false) => cases.push((0, bid)),
+                crate::ast::PatternKind::Wildcard | crate::ast::PatternKind::Binding(_) => {}
+            }
+        }
+
+        let catch_all = arms.iter().position(|a| {
+            matches!(
+                a.pattern.kind,
+                crate::ast::PatternKind::Wildcard | crate::ast::PatternKind::Binding(_)
+            )
+        });
+        let (switch_default, orphan_default) = if let Some(idx) = catch_all {
+            (arm_blocks[idx], None)
+        } else {
+            let default_id = self.new_block("match.default");
+            (default_id, Some(default_id))
+        };
+
+        self.set_term(Terminator::Switch {
+            discr: tag,
+            cases,
+            default: switch_default,
+        });
+
+        let mut arm_terminated = Vec::new();
+        let mut join_needed = false;
+        for (i, arm) in arms.iter().enumerate() {
+            self.switch_to(arm_blocks[i]);
+            let depth_before_arm = self.arena_depth;
+            self.push_scope();
+            self.bind_pattern(&arm.pattern, moved, &scrut_ty, arm.pattern.span);
+            self.lower_block_stmts(&arm.body);
+            let term = self.current_terminated();
+            arm_terminated.push(term);
+            self.pop_scope();
+            self.arena_depth = depth_before_arm;
+            if !term {
+                join_needed = true;
+            }
+        }
+
+        if let Some(default_id) = orphan_default {
+            self.switch_to(default_id);
+            self.set_term(Terminator::Unreachable);
+        }
+
+        if arm_terminated.iter().all(|t| *t) {
+            self.sealed = true;
+        } else if join_needed {
+            let join_id = self.new_block("match.join");
+            for (i, term) in arm_terminated.iter().enumerate() {
+                if !*term {
+                    self.switch_to(arm_blocks[i]);
+                    self.set_term(Terminator::Jump(join_id));
+                }
+            }
+            self.switch_to(join_id);
+        }
+    }
+
+    fn bind_pattern(
+        &mut self,
+        pattern: &crate::ast::Pattern,
+        scrut: ValueId,
+        scrut_ty: &Type,
+        span: Span,
+    ) {
+        match &pattern.kind {
+            crate::ast::PatternKind::Wildcard => {}
+            crate::ast::PatternKind::Binding(name) => {
+                let ptr = self.alloca(scrut_ty.clone(), span);
+                self.push_store(ptr, scrut, span);
+                self.declare(
+                    name,
+                    LocalSlot {
+                        ptr,
+                        ty: scrut_ty.clone(),
+                        mutable: false,
+                    },
+                );
+            }
+            crate::ast::PatternKind::Bool(_) => {}
+            crate::ast::PatternKind::Variant {
+                enum_name,
+                variant,
+                fields,
+            } => {
+                let Some(info) = self.typed.enums.get(enum_name) else {
+                    return;
+                };
+                let Some(vinfo) = info.variants.iter().find(|v| v.name == *variant) else {
+                    return;
+                };
+                for (i, sub) in fields.iter().enumerate() {
+                    let Some((_, fty)) = vinfo.fields.get(i) else {
+                        break;
+                    };
+                    let extracted = self.push_valued(
+                        fty.clone(),
+                        InstKind::EnumField {
+                            value: scrut,
+                            variant_index: vinfo.tag as usize,
+                            field_index: i,
+                        },
+                        span,
+                    );
+                    match &sub.kind {
+                        crate::ast::PatternKind::Wildcard => {}
+                        crate::ast::PatternKind::Binding(name) => {
+                            let ptr = self.alloca(fty.clone(), span);
+                            let stored = if fty.is_copy() {
+                                extracted
+                            } else {
+                                self.push_valued(
+                                    fty.clone(),
+                                    InstKind::Move { value: extracted },
+                                    span,
+                                )
+                            };
+                            self.push_store(ptr, stored, span);
+                            self.declare(
+                                name,
+                                LocalSlot {
+                                    ptr,
+                                    ty: fty.clone(),
+                                    mutable: false,
+                                },
+                            );
+                        }
+                        other => {
+                            // Nested variant patterns are not supported in MVP.
+                            let _ = other;
+                            self.diagnostics.error_at(
+                                sub.span,
+                                "nested variant patterns are not supported in this release",
+                            );
+                        }
+                    }
+                }
             }
         }
     }
@@ -450,6 +704,46 @@ impl<'a> FunctionBuilder<'a> {
                     );
                     return (id, Type::CString);
                 }
+                if fname == "len" {
+                    let ty = match &args[0].kind {
+                        ExprKind::Name(name) => {
+                            self.lookup(name).map(|l| l.ty.clone()).unwrap_or(Type::I64)
+                        }
+                        _ => {
+                            // Use the type of the already-lowered value when possible.
+                            Type::Slice(Box::new(Type::I64))
+                        }
+                    };
+                    let v = arg_ids[0];
+                    match &ty {
+                        Type::Array { len, .. } => {
+                            let id = self.push_valued(
+                                Type::I64,
+                                InstKind::ConstI64(*len as i64),
+                                expr.span,
+                            );
+                            return (id, Type::I64);
+                        }
+                        Type::Ref { inner, .. } => {
+                            if let Type::Array { len, .. } = inner.as_ref() {
+                                let id = self.push_valued(
+                                    Type::I64,
+                                    InstKind::ConstI64(*len as i64),
+                                    expr.span,
+                                );
+                                return (id, Type::I64);
+                            }
+                            let id =
+                                self.push_valued(Type::I64, InstKind::Len { value: v }, expr.span);
+                            return (id, Type::I64);
+                        }
+                        _ => {
+                            let id =
+                                self.push_valued(Type::I64, InstKind::Len { value: v }, expr.span);
+                            return (id, Type::I64);
+                        }
+                    }
+                }
                 let (ret_ty, is_extern) = if let Some(info) = self.typed.functions.get(&fname) {
                     (info.return_type.clone(), info.is_extern)
                 } else {
@@ -500,6 +794,39 @@ impl<'a> FunctionBuilder<'a> {
                 );
                 (id, ty)
             }
+            ExprKind::EnumConstruct {
+                enum_name,
+                variant,
+                args,
+            } => {
+                let info = self
+                    .typed
+                    .enums
+                    .get(enum_name)
+                    .cloned()
+                    .expect("enum resolved");
+                let vinfo = info
+                    .variants
+                    .iter()
+                    .find(|v| v.name == *variant)
+                    .cloned()
+                    .expect("variant resolved");
+                let mut field_vals = Vec::new();
+                for a in args {
+                    field_vals.push(self.lower_expr(a).0);
+                }
+                let ty = Type::Enum(enum_name.clone());
+                let id = self.push_valued(
+                    ty.clone(),
+                    InstKind::EnumConstruct {
+                        enum_name: enum_name.clone(),
+                        variant_index: vinfo.tag as usize,
+                        fields: field_vals,
+                    },
+                    expr.span,
+                );
+                (id, ty)
+            }
             ExprKind::Cast { expr: inner, ty } => {
                 let (v, _) = self.lower_expr(inner);
                 let to = self.resolve_type_expr(ty);
@@ -531,11 +858,83 @@ impl<'a> FunctionBuilder<'a> {
                 let id = self.push_valued(inner_ty.clone(), InstKind::Deref { ptr }, expr.span);
                 (id, inner_ty)
             }
-            ExprKind::Index { .. } => {
-                self.diagnostics
-                    .error_at(expr.span, "indexing is not available in Alpha-1.0.0");
-                let id = self.push_valued(Type::Unit, InstKind::Nop, expr.span);
-                (id, Type::Unit)
+            ExprKind::Index { base, index } => {
+                let (base_val, base_ty, _root) = self.lower_index_base(base);
+                let (idx, _) = self.lower_expr(index);
+                let len = self.push_len_of(&base_ty, base_val, expr.span);
+                self.push_inst(
+                    Type::Unit,
+                    InstKind::BoundsCheck { index: idx, len },
+                    expr.span,
+                );
+                let elem_ty = base_ty.element_type().cloned().unwrap_or(Type::Unit);
+                let elem_ptr = self.push_valued(
+                    Type::Ref {
+                        mutable: false,
+                        inner: Box::new(elem_ty.clone()),
+                    },
+                    InstKind::ElemPtr {
+                        base: base_val,
+                        index: idx,
+                    },
+                    expr.span,
+                );
+                let id =
+                    self.push_valued(elem_ty.clone(), InstKind::Load { ptr: elem_ptr }, expr.span);
+                (id, elem_ty)
+            }
+            ExprKind::ArrayLit { elems } => {
+                let mut vals = Vec::new();
+                let mut elem_ty = Type::Unit;
+                for (i, e) in elems.iter().enumerate() {
+                    let (v, t) = self.lower_expr(e);
+                    if i == 0 {
+                        elem_ty = t;
+                    }
+                    vals.push(v);
+                }
+                let ty = Type::Array {
+                    element: Box::new(elem_ty),
+                    len: elems.len(),
+                };
+                let id =
+                    self.push_valued(ty.clone(), InstKind::ArrayAgg { elems: vals }, expr.span);
+                (id, ty)
+            }
+            ExprKind::Slice { base, start, end } => {
+                let (base_val, base_ty, _root) = self.lower_index_base(base);
+                let start_v = if let Some(s) = start {
+                    self.lower_expr(s).0
+                } else {
+                    self.push_valued(Type::I64, InstKind::ConstI64(0), expr.span)
+                };
+                let end_v = if let Some(e) = end {
+                    self.lower_expr(e).0
+                } else {
+                    self.push_len_of(&base_ty, base_val, expr.span)
+                };
+                let len = self.push_len_of(&base_ty, base_val, expr.span);
+                self.push_inst(
+                    Type::Unit,
+                    InstKind::SliceBoundsCheck {
+                        start: start_v,
+                        end: end_v,
+                        len,
+                    },
+                    expr.span,
+                );
+                let elem = base_ty.element_type().cloned().unwrap_or(Type::Unit);
+                let slice_ty = Type::Slice(Box::new(elem));
+                let id = self.push_valued(
+                    slice_ty.clone(),
+                    InstKind::SliceFrom {
+                        base: base_val,
+                        start: start_v,
+                        end: end_v,
+                    },
+                    expr.span,
+                );
+                (id, slice_ty)
             }
         }
     }
@@ -556,13 +955,25 @@ impl<'a> FunctionBuilder<'a> {
                 mutable: *mutable,
                 inner: Box::new(self.resolve_type_expr(inner)),
             },
+            TypeExprKind::Array { elem, len } => Type::Array {
+                element: Box::new(self.resolve_type_expr(elem)),
+                len: *len as usize,
+            },
+            TypeExprKind::Slice { elem } => Type::Slice(Box::new(self.resolve_type_expr(elem))),
         }
     }
 
     fn lower_ref(&mut self, mutable: bool, inner: &Expr, span: Span) -> (ValueId, Type) {
+        self.last_alias_root = None;
         match &inner.kind {
             ExprKind::Name(name) => {
                 let local = self.lookup(name).cloned().expect("name");
+                let root = self
+                    .slot_alias_roots
+                    .get(&local.ptr)
+                    .copied()
+                    .unwrap_or(local.ptr);
+                self.last_alias_root = Some(root);
                 let ty = Type::Ref {
                     mutable,
                     inner: Box::new(local.ty.clone()),
@@ -572,15 +983,132 @@ impl<'a> FunctionBuilder<'a> {
                     InstKind::Ref {
                         mutable,
                         place: local.ptr,
+                        alias_root: Some(root),
                     },
                     span,
                 );
                 (id, ty)
             }
+            ExprKind::Deref { expr } => {
+                // Reborrow through an existing reference instead of copying into a temporary.
+                let (ptr, pty) = self.lower_expr(expr);
+                let inner_ty = match pty {
+                    Type::Ref { inner, .. } => *inner,
+                    other => {
+                        self.diagnostics.error_at(
+                            span,
+                            format!("cannot reborrow through `{}`", other.display()),
+                        );
+                        Type::Unit
+                    }
+                };
+                let ty = Type::Ref {
+                    mutable,
+                    inner: Box::new(inner_ty),
+                };
+                let id = self.push_valued(
+                    ty.clone(),
+                    InstKind::Ref {
+                        mutable,
+                        place: ptr,
+                        alias_root: None,
+                    },
+                    span,
+                );
+                (id, ty)
+            }
+            ExprKind::Index { base, index } => {
+                let (base_val, base_ty, root) = self.lower_index_base(base);
+                self.last_alias_root = Some(root);
+                let (idx, _) = self.lower_expr(index);
+                let len = self.push_len_of(&base_ty, base_val, span);
+                self.push_inst(Type::Unit, InstKind::BoundsCheck { index: idx, len }, span);
+                let elem_ty = base_ty.element_type().cloned().unwrap_or(Type::Unit);
+                let elem_ptr = self.push_valued(
+                    Type::Ref {
+                        mutable,
+                        inner: Box::new(elem_ty.clone()),
+                    },
+                    InstKind::ElemPtr {
+                        base: base_val,
+                        index: idx,
+                    },
+                    span,
+                );
+                let ty = Type::Ref {
+                    mutable,
+                    inner: Box::new(elem_ty),
+                };
+                let id = self.push_valued(
+                    ty.clone(),
+                    InstKind::Ref {
+                        mutable,
+                        place: elem_ptr,
+                        alias_root: Some(root),
+                    },
+                    span,
+                );
+                (id, ty)
+            }
+            ExprKind::Slice { .. } => {
+                if let ExprKind::Slice { base, start, end } = &inner.kind {
+                    let (base_val, base_ty, root) = self.lower_index_base(base);
+                    self.last_alias_root = Some(root);
+                    let start_v = if let Some(s) = start {
+                        self.lower_expr(s).0
+                    } else {
+                        self.push_valued(Type::I64, InstKind::ConstI64(0), span)
+                    };
+                    let end_v = if let Some(e) = end {
+                        self.lower_expr(e).0
+                    } else {
+                        self.push_len_of(&base_ty, base_val, span)
+                    };
+                    let len = self.push_len_of(&base_ty, base_val, span);
+                    self.push_inst(
+                        Type::Unit,
+                        InstKind::SliceBoundsCheck {
+                            start: start_v,
+                            end: end_v,
+                            len,
+                        },
+                        span,
+                    );
+                    let elem = base_ty.element_type().cloned().unwrap_or(Type::Unit);
+                    let slice_ty = Type::Slice(Box::new(elem));
+                    let slice_val = self.push_valued(
+                        slice_ty.clone(),
+                        InstKind::SliceFrom {
+                            base: base_val,
+                            start: start_v,
+                            end: end_v,
+                        },
+                        span,
+                    );
+                    let ptr = self.alloca(slice_ty.clone(), span);
+                    self.push_store(ptr, slice_val, span);
+                    let ty = Type::Ref {
+                        mutable,
+                        inner: Box::new(slice_ty),
+                    };
+                    let id = self.push_valued(
+                        ty.clone(),
+                        InstKind::Ref {
+                            mutable,
+                            place: ptr,
+                            alias_root: Some(root),
+                        },
+                        span,
+                    );
+                    return (id, ty);
+                }
+                unreachable!()
+            }
             _ => {
                 let (v, ty) = self.lower_expr(inner);
                 let ptr = self.alloca(ty.clone(), span);
                 self.push_store(ptr, v, span);
+                self.last_alias_root = Some(ptr);
                 let rty = Type::Ref {
                     mutable,
                     inner: Box::new(ty),
@@ -590,11 +1118,80 @@ impl<'a> FunctionBuilder<'a> {
                     InstKind::Ref {
                         mutable,
                         place: ptr,
+                        alias_root: Some(ptr),
                     },
                     span,
                 );
                 (id, rty)
             }
+        }
+    }
+
+    /// Returns (base_value_or_ptr, logical_base_type, alias_root_alloca).
+    fn lower_index_base(&mut self, base: &Expr) -> (ValueId, Type, ValueId) {
+        match &base.kind {
+            ExprKind::Name(name) => {
+                let local = self.lookup(name).cloned().expect("name");
+                match &local.ty {
+                    // `&[T]` locals hold a fat pointer value in their slot.
+                    Type::Ref { inner, .. } if matches!(inner.as_ref(), Type::Slice(_)) => {
+                        let loaded = self.push_valued(
+                            local.ty.clone(),
+                            InstKind::Load { ptr: local.ptr },
+                            base.span,
+                        );
+                        let root = self
+                            .slot_alias_roots
+                            .get(&local.ptr)
+                            .copied()
+                            .unwrap_or(local.ptr);
+                        (loaded, local.ty.clone(), root)
+                    }
+                    _ => {
+                        let root = self
+                            .slot_alias_roots
+                            .get(&local.ptr)
+                            .copied()
+                            .unwrap_or(local.ptr);
+                        (local.ptr, local.ty.clone(), root)
+                    }
+                }
+            }
+            ExprKind::Deref { expr } => {
+                let (ptr, pty) = self.lower_expr(expr);
+                let inner = match pty {
+                    Type::Ref { inner, .. } => *inner,
+                    other => other,
+                };
+                // For `&arr` / `&mut arr`, ptr points at the array; alias root is ptr.
+                // For slice refs, ptr/value is the fat pointer itself.
+                (ptr, inner, ptr)
+            }
+            _ => {
+                let (v, ty) = self.lower_expr(base);
+                match &ty {
+                    Type::Ref { inner, .. } if matches!(inner.as_ref(), Type::Slice(_)) => {
+                        (v, ty.clone(), v)
+                    }
+                    Type::Slice(_) => (v, ty.clone(), v),
+                    _ => {
+                        let ptr = self.alloca(ty.clone(), base.span);
+                        self.push_store(ptr, v, base.span);
+                        (ptr, ty, ptr)
+                    }
+                }
+            }
+        }
+    }
+
+    fn push_len_of(&mut self, ty: &Type, base: ValueId, span: Span) -> ValueId {
+        match ty {
+            Type::Array { len, .. } => {
+                self.push_valued(Type::I64, InstKind::ConstI64(*len as i64), span)
+            }
+            Type::Ref { inner, .. } => self.push_len_of(inner, base, span),
+            Type::Slice(_) => self.push_valued(Type::I64, InstKind::Len { value: base }, span),
+            _ => self.push_valued(Type::I64, InstKind::Len { value: base }, span),
         }
     }
 

@@ -143,6 +143,11 @@ Reglas breves:
 
 - Una referencia no puede vivir más que el valor.
 - No puede coexistir un préstamo mutable con otros préstamos del mismo valor.
+- Los préstamos terminan en el último uso de la referencia (NLL-lite), así que se permiten `&mut` secuenciales no solapados.
+
+Para entender el algoritmo completo —CFG, liveness, joins, places, carriers y
+provenance de arena— consulta la
+[guía técnica del borrow checker](borrow-checker.md).
 
 ## Cadenas y C
 

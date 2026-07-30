@@ -49,19 +49,74 @@ impl<'a> Parser<'a> {
         match &self.current().kind {
             TokenKind::Fn => self.parse_function().map(Item::Function),
             TokenKind::Struct => self.parse_struct().map(Item::Struct),
+            TokenKind::Enum => self.parse_enum().map(Item::Enum),
             TokenKind::Extern => self.parse_extern().map(Item::Extern),
             _ => {
                 let tok = self.current().clone();
                 self.diagnostics.error_at(
                     tok.span,
                     format!(
-                        "expected item (`fn`, `struct`, or `extern`), found {}",
+                        "expected item (`fn`, `struct`, `enum`, or `extern`), found {}",
                         tok.kind
                     ),
                 );
                 None
             }
         }
+    }
+
+    fn parse_enum(&mut self) -> Option<EnumDef> {
+        let start = self.bump().span;
+        let (name, _) = self.expect_ident()?;
+        self.expect(&TokenKind::Colon)?;
+        self.expect_newline_or_skip();
+        self.expect(&TokenKind::Indent)?;
+        let mut variants = Vec::new();
+        while !matches!(self.current().kind, TokenKind::Dedent | TokenKind::Eof) {
+            self.skip_newlines();
+            if matches!(self.current().kind, TokenKind::Dedent | TokenKind::Eof) {
+                break;
+            }
+            let (vname, vspan) = self.expect_ident()?;
+            let mut fields = Vec::new();
+            if self.eat(&TokenKind::LParen) {
+                if !matches!(self.current().kind, TokenKind::RParen) {
+                    loop {
+                        let (fname, fspan) = self.expect_ident()?;
+                        self.expect(&TokenKind::Colon)?;
+                        let ty = self.parse_type()?;
+                        fields.push(Field {
+                            name: fname,
+                            ty,
+                            span: fspan,
+                        });
+                        if self.eat(&TokenKind::Comma) {
+                            continue;
+                        }
+                        break;
+                    }
+                }
+                self.expect(&TokenKind::RParen)?;
+            }
+            variants.push(VariantDef {
+                name: vname,
+                fields,
+                span: vspan.merge(self.previous_span()),
+            });
+            self.skip_newlines();
+        }
+        self.expect(&TokenKind::Dedent)?;
+        if variants.is_empty() {
+            self.diagnostics.error_at(
+                start,
+                format!("enum `{name}` must have at least one variant"),
+            );
+        }
+        Some(EnumDef {
+            name,
+            variants,
+            span: start.merge(self.previous_span()),
+        })
     }
 
     fn parse_struct(&mut self) -> Option<StructDef> {
@@ -216,6 +271,7 @@ impl<'a> Parser<'a> {
             TokenKind::While => self.parse_while(),
             TokenKind::Arena => self.parse_arena(),
             TokenKind::Unsafe => self.parse_unsafe(),
+            TokenKind::Match => self.parse_match(),
             _ => {
                 let expr = self.parse_expr()?;
                 if self.eat(&TokenKind::Eq) {
@@ -336,6 +392,107 @@ impl<'a> Parser<'a> {
         })
     }
 
+    fn parse_match(&mut self) -> Option<Stmt> {
+        let start = self.bump().span;
+        let scrutinee = self.parse_expr()?;
+        self.expect(&TokenKind::Colon)?;
+        self.expect_newline_or_skip();
+        self.expect(&TokenKind::Indent)?;
+        let mut arms = Vec::new();
+        while !matches!(self.current().kind, TokenKind::Dedent | TokenKind::Eof) {
+            self.skip_newlines();
+            if matches!(self.current().kind, TokenKind::Dedent | TokenKind::Eof) {
+                break;
+            }
+            self.expect(&TokenKind::Case)?;
+            let pattern = self.parse_pattern()?;
+            self.expect(&TokenKind::Colon)?;
+            let body = self.parse_block()?;
+            let span = pattern.span.merge(body.span);
+            arms.push(MatchArm {
+                pattern,
+                body,
+                span,
+            });
+            self.skip_newlines();
+        }
+        self.expect(&TokenKind::Dedent)?;
+        if arms.is_empty() {
+            self.diagnostics
+                .error_at(start, "`match` requires at least one `case` arm");
+        }
+        Some(Stmt::Match {
+            scrutinee,
+            arms,
+            span: start.merge(self.previous_span()),
+        })
+    }
+
+    fn parse_pattern(&mut self) -> Option<Pattern> {
+        let tok = self.current().clone();
+        match &tok.kind {
+            TokenKind::Ident(name) if name == "_" => {
+                self.bump();
+                Some(Pattern {
+                    kind: PatternKind::Wildcard,
+                    span: tok.span,
+                })
+            }
+            TokenKind::True => {
+                self.bump();
+                Some(Pattern {
+                    kind: PatternKind::Bool(true),
+                    span: tok.span,
+                })
+            }
+            TokenKind::False => {
+                self.bump();
+                Some(Pattern {
+                    kind: PatternKind::Bool(false),
+                    span: tok.span,
+                })
+            }
+            TokenKind::Ident(name) => {
+                let enum_name = name.clone();
+                self.bump();
+                if self.eat(&TokenKind::ColonColon) {
+                    let (variant, _) = self.expect_ident()?;
+                    let mut fields = Vec::new();
+                    if self.eat(&TokenKind::LParen) {
+                        if !matches!(self.current().kind, TokenKind::RParen) {
+                            loop {
+                                fields.push(self.parse_pattern()?);
+                                if self.eat(&TokenKind::Comma) {
+                                    continue;
+                                }
+                                break;
+                            }
+                        }
+                        self.expect(&TokenKind::RParen)?;
+                    }
+                    Some(Pattern {
+                        kind: PatternKind::Variant {
+                            enum_name,
+                            variant,
+                            fields,
+                        },
+                        span: tok.span.merge(self.previous_span()),
+                    })
+                } else {
+                    Some(Pattern {
+                        kind: PatternKind::Binding(enum_name),
+                        span: tok.span,
+                    })
+                }
+            }
+            _ => {
+                self.diagnostics
+                    .error_at(tok.span, format!("expected pattern, found {}", tok.kind));
+                None
+            }
+        }
+    }
+
     fn parse_type(&mut self) -> Option<TypeExpr> {
         let start = self.current().span;
         if self.eat(&TokenKind::Amp) {
@@ -352,6 +509,47 @@ impl<'a> Parser<'a> {
         if self.eat(&TokenKind::LParen) {
             self.expect(&TokenKind::RParen)?;
             return Some(TypeExpr::unit(start.merge(self.previous_span())));
+        }
+        if self.eat(&TokenKind::LBracket) {
+            let elem = self.parse_type()?;
+            if self.eat(&TokenKind::Semi) {
+                let len = match &self.current().kind {
+                    TokenKind::Int(n) => {
+                        let n = *n;
+                        self.bump();
+                        if n < 0 {
+                            self.diagnostics.error_at(
+                                self.previous_span(),
+                                "array length must be a non-negative integer",
+                            );
+                        }
+                        n.max(0)
+                    }
+                    _ => {
+                        let tok = self.current().clone();
+                        self.diagnostics.error_at(
+                            tok.span,
+                            format!("expected array length integer, found {}", tok.kind),
+                        );
+                        return None;
+                    }
+                };
+                self.expect(&TokenKind::RBracket)?;
+                return Some(TypeExpr {
+                    kind: TypeExprKind::Array {
+                        elem: Box::new(elem),
+                        len,
+                    },
+                    span: start.merge(self.previous_span()),
+                });
+            }
+            self.expect(&TokenKind::RBracket)?;
+            return Some(TypeExpr {
+                kind: TypeExprKind::Slice {
+                    elem: Box::new(elem),
+                },
+                span: start.merge(self.previous_span()),
+            });
         }
         let (name, span) = self.expect_ident()?;
         if name == "unit" {
@@ -466,16 +664,54 @@ impl<'a> Parser<'a> {
                     span,
                 };
             } else if self.eat(&TokenKind::LBracket) {
-                let index = self.parse_expr()?;
-                self.expect(&TokenKind::RBracket)?;
-                let span = expr.span.merge(self.previous_span());
-                expr = Expr {
-                    kind: ExprKind::Index {
-                        base: Box::new(expr),
-                        index: Box::new(index),
-                    },
-                    span,
-                };
+                // Index `a[i]` or slice `a[start..end]` / `a[..]` / `a[start..]` / `a[..end]`
+                if matches!(self.current().kind, TokenKind::DotDot) {
+                    self.bump(); // ..
+                    let end = if matches!(self.current().kind, TokenKind::RBracket) {
+                        None
+                    } else {
+                        Some(Box::new(self.parse_expr()?))
+                    };
+                    self.expect(&TokenKind::RBracket)?;
+                    let span = expr.span.merge(self.previous_span());
+                    expr = Expr {
+                        kind: ExprKind::Slice {
+                            base: Box::new(expr),
+                            start: None,
+                            end,
+                        },
+                        span,
+                    };
+                } else {
+                    let first = self.parse_expr()?;
+                    if self.eat(&TokenKind::DotDot) {
+                        let end = if matches!(self.current().kind, TokenKind::RBracket) {
+                            None
+                        } else {
+                            Some(Box::new(self.parse_expr()?))
+                        };
+                        self.expect(&TokenKind::RBracket)?;
+                        let span = expr.span.merge(self.previous_span());
+                        expr = Expr {
+                            kind: ExprKind::Slice {
+                                base: Box::new(expr),
+                                start: Some(Box::new(first)),
+                                end,
+                            },
+                            span,
+                        };
+                    } else {
+                        self.expect(&TokenKind::RBracket)?;
+                        let span = expr.span.merge(self.previous_span());
+                        expr = Expr {
+                            kind: ExprKind::Index {
+                                base: Box::new(expr),
+                                index: Box::new(first),
+                            },
+                            span,
+                        };
+                    }
+                }
             } else if self.eat(&TokenKind::As) {
                 let ty = self.parse_type()?;
                 let span = expr.span.merge(ty.span);
@@ -533,6 +769,31 @@ impl<'a> Parser<'a> {
             }
             TokenKind::Ident(name) => {
                 self.bump();
+                // Enum constructor: Name::Variant(...) or Name::Variant
+                if self.eat(&TokenKind::ColonColon) {
+                    let (variant, _) = self.expect_ident()?;
+                    let mut args = Vec::new();
+                    if self.eat(&TokenKind::LParen) {
+                        if !matches!(self.current().kind, TokenKind::RParen) {
+                            loop {
+                                args.push(self.parse_expr()?);
+                                if self.eat(&TokenKind::Comma) {
+                                    continue;
+                                }
+                                break;
+                            }
+                        }
+                        self.expect(&TokenKind::RParen)?;
+                    }
+                    return Some(Expr {
+                        kind: ExprKind::EnumConstruct {
+                            enum_name: name,
+                            variant,
+                            args,
+                        },
+                        span: tok.span.merge(self.previous_span()),
+                    });
+                }
                 // Struct literal: Name { field: expr, ... }
                 if matches!(self.current().kind, TokenKind::LBrace) {
                     self.bump();
@@ -571,6 +832,27 @@ impl<'a> Parser<'a> {
                 self.expect(&TokenKind::RParen)?;
                 Some(expr)
             }
+            TokenKind::LBracket => {
+                self.bump();
+                let mut elems = Vec::new();
+                if !matches!(self.current().kind, TokenKind::RBracket) {
+                    loop {
+                        elems.push(self.parse_expr()?);
+                        if self.eat(&TokenKind::Comma) {
+                            if matches!(self.current().kind, TokenKind::RBracket) {
+                                break;
+                            }
+                            continue;
+                        }
+                        break;
+                    }
+                }
+                self.expect(&TokenKind::RBracket)?;
+                Some(Expr {
+                    kind: ExprKind::ArrayLit { elems },
+                    span: tok.span.merge(self.previous_span()),
+                })
+            }
             _ => {
                 self.diagnostics
                     .error_at(tok.span, format!("expected expression, found {}", tok.kind));
@@ -584,7 +866,11 @@ impl<'a> Parser<'a> {
         while !self.is_eof() {
             if matches!(
                 self.current().kind,
-                TokenKind::Fn | TokenKind::Struct | TokenKind::Extern | TokenKind::Eof
+                TokenKind::Fn
+                    | TokenKind::Struct
+                    | TokenKind::Enum
+                    | TokenKind::Extern
+                    | TokenKind::Eof
             ) {
                 break;
             }
@@ -740,7 +1026,8 @@ impl StmtSpan for Stmt {
             | Stmt::If { span, .. }
             | Stmt::While { span, .. }
             | Stmt::Arena { span, .. }
-            | Stmt::Unsafe { span, .. } => *span,
+            | Stmt::Unsafe { span, .. }
+            | Stmt::Match { span, .. } => *span,
         }
     }
 }
@@ -762,5 +1049,47 @@ mod tests {
     fn parses_main() {
         let prog = parse_ok("fn main() -> i64:\n    return 1\n");
         assert_eq!(prog.items.len(), 1);
+    }
+
+    #[test]
+    fn parses_array_literal_index_and_slice() {
+        let prog = parse_ok(
+            "fn main() -> i64:\n    let a: [i64; 3] = [1, 2, 3]\n    let x = a[1]\n    let s = &a[0..2]\n    return x\n",
+        );
+        assert_eq!(prog.items.len(), 1);
+        let Item::Function(f) = &prog.items[0] else {
+            panic!("expected function");
+        };
+        assert!(matches!(
+            f.body.stmts[0],
+            Stmt::Let {
+                value: Expr {
+                    kind: ExprKind::ArrayLit { .. },
+                    ..
+                },
+                ..
+            }
+        ));
+        assert!(matches!(
+            f.body.stmts[1],
+            Stmt::Let {
+                value: Expr {
+                    kind: ExprKind::Index { .. },
+                    ..
+                },
+                ..
+            }
+        ));
+        match &f.body.stmts[2] {
+            Stmt::Let {
+                value:
+                    Expr {
+                        kind: ExprKind::Ref { expr, .. },
+                        ..
+                    },
+                ..
+            } => assert!(matches!(expr.kind, ExprKind::Slice { .. })),
+            other => panic!("expected ref-to-slice let, got {other:?}"),
+        }
     }
 }

@@ -59,7 +59,8 @@ Un agente puede reescribir una sola función con precisión si conserva:
 1. **Compartido XOR mutable:** muchos `&T`, o un solo `&mut T`, nunca ambos.
 2. **No mover mientras hay préstamos.**
 3. **No asignar** a un lugar con préstamo compartido activo.
-4. **Arenas:** la memoria de `arena:` muere al cerrar el bloque (también con `return`). No devuelvas referencias a la arena.
+4. **Vida local y de arena:** el almacenamiento local muere al salir de la función y la memoria de `arena:` al cerrar el bloque (también con `return`). Devuelve valores propios o referencias recibidas del llamador, nunca referencias locales ni punteros respaldados por arena.
+5. **NLL-lite:** el préstamo termina en el último uso de la referencia (incluido el local que la guarda), no al cerrar el bloque léxico. Se permiten `&mut` secuenciales no solapados del mismo lugar.
 
 ## 5. Diagnósticos para bucles de auto-corrección
 
@@ -95,7 +96,7 @@ Cada línea es un objeto JSON (NDJSON) con:
 | `E0400` | conflicto de préstamos |
 | `E0401` | asignación mientras está prestado |
 | `E0402` | movimiento mientras está prestado |
-| `E0403` | referencia escapa de arena |
+| `E0403` | escapa una referencia local o un puntero respaldado por arena |
 | `E0404` | enter/exit de arena desbalanceado |
 | `E0500` | frontera FFI/unsafe |
 

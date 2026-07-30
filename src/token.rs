@@ -29,6 +29,9 @@ pub enum TokenKind {
     And,
     Or,
     Not,
+    Enum,
+    Match,
+    Case,
 
     // Identifiers and literals
     Ident(String),
@@ -65,6 +68,7 @@ pub enum TokenKind {
     GtEq,
     Amp,        // &
     ColonColon, // ::
+    DotDot,     // ..
 
     // Indentation
     Newline,
@@ -94,6 +98,9 @@ impl TokenKind {
             "and" => TokenKind::And,
             "or" => TokenKind::Or,
             "not" => TokenKind::Not,
+            "enum" => TokenKind::Enum,
+            "match" => TokenKind::Match,
+            "case" => TokenKind::Case,
             _ => return None,
         })
     }
@@ -119,6 +126,9 @@ impl fmt::Display for TokenKind {
             TokenKind::And => "and",
             TokenKind::Or => "or",
             TokenKind::Not => "not",
+            TokenKind::Enum => "enum",
+            TokenKind::Match => "match",
+            TokenKind::Case => "case",
             TokenKind::Ident(s) => return write!(f, "identifier `{s}`"),
             TokenKind::Int(n) => return write!(f, "integer {n}"),
             TokenKind::Float(n) => return write!(f, "float {n}"),
@@ -148,6 +158,7 @@ impl fmt::Display for TokenKind {
             TokenKind::GtEq => ">=",
             TokenKind::Amp => "&",
             TokenKind::ColonColon => "::",
+            TokenKind::DotDot => "..",
             TokenKind::Newline => "newline",
             TokenKind::Indent => "indent",
             TokenKind::Dedent => "dedent",

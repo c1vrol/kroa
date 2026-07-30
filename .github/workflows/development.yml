@@ -1,0 +1,81 @@
+name: Development artifacts
+
+on:
+  push:
+    branches: [develop]
+  workflow_dispatch:
+
+concurrency:
+  group: development-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-dev:
+    name: Build development artifact
+    runs-on: ${{ matrix.os }}
+    environment: development
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: kroa-linux-x86_64-dev
+          - os: windows-latest
+            artifact: kroa-windows-x86_64-dev
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install LLVM/Clang (Ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm
+
+      - name: Install LLVM/Clang (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          choco install llvm --yes --no-progress
+          echo "C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Package Linux artifact
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p dist
+          cp target/release/kroa dist/
+          cp README.md CHANGELOG.md LICENSE dist/
+          (cd dist && sha256sum kroa > SHA256SUMS.txt)
+          tar -C dist -czf ${{ matrix.artifact }}.tar.gz kroa README.md CHANGELOG.md LICENSE SHA256SUMS.txt
+
+      - name: Package Windows artifact
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path dist -Force | Out-Null
+          Copy-Item target/release/kroa.exe dist/
+          Copy-Item README.md,CHANGELOG.md,LICENSE dist/
+          $hash = (Get-FileHash dist/kroa.exe -Algorithm SHA256).Hash.ToLower()
+          "SHA256 (kroa.exe) = $hash" | Set-Content dist/SHA256SUMS.txt
+          Compress-Archive -Path dist/* -DestinationPath "${{ matrix.artifact }}.zip"
+
+      - name: Upload development artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            *.tar.gz
+            *.zip
+          retention-days: 14
+          if-no-files-found: error

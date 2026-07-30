@@ -1,6 +1,6 @@
 [package]
 name = "kroa"
-version = "1.0.0-alpha"
+version = "2.0.0-alpha"
 edition = "2021"
 description = "Kroa programming language compiler"
 authors = ["Kroa Contributors"]
