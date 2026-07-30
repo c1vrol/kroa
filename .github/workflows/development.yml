@@ -27,7 +27,7 @@ jobs:
             artifact: kroa-windows-x86_64-dev
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
