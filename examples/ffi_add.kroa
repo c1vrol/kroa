@@ -1,0 +1,5 @@
+extern "C" fn kroa_add(a: i64, b: i64) -> i64
+
+fn main() -> i64:
+    print_i64(kroa_add(20, 22))
+    return 0

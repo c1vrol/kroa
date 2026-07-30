@@ -1,0 +1,9 @@
+extern "C" fn kroa_strlen_c(s: c_string) -> i64
+
+fn main() -> i64:
+    arena:
+        unsafe:
+            let s = "kroa"
+            let c = to_c_string(s)
+            print_i64(kroa_strlen_c(c))
+    return 0

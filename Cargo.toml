@@ -1,0 +1,19 @@
+[package]
+name = "kroa"
+version = "1.0.0-alpha"
+edition = "2021"
+description = "Kroa programming language compiler"
+authors = ["Kroa Contributors"]
+license = "MIT"
+readme = "README.md"
+default-run = "kroa"
+
+[[bin]]
+name = "kroa"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "3.14"

@@ -1,0 +1,9 @@
+fn add_one(x: &mut i64) -> unit:
+    *x = *x + 1
+    return
+
+fn main() -> i64:
+    let mut n = 41
+    add_one(&mut n)
+    print_i64(n)
+    return 0
