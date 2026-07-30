@@ -32,7 +32,7 @@ jobs:
             echo "Tag must match A-MAJOR.MINOR.PATCH"
             exit 1
           fi
-          CARGO_VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+          CARGO_VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1 | tr -d '\r')"
           EXPECTED="${TAG#A-}-alpha"
           echo "cargo_version=${CARGO_VERSION}" >> "$GITHUB_OUTPUT"
           echo "tag=${TAG} cargo=${CARGO_VERSION} expected=${EXPECTED}"
